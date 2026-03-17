@@ -1,0 +1,8 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - algorithm@algorithm.off_policy: off_policy
+  - _self_

@@ -1,0 +1,32 @@
+# Synchronous off-policy replay buffer configuration.
+# This feature replays past online rollout samples in the main PPO trainer.
+
+# Whether to enable off-policy replay.
+enable: false
+
+# Maximum number of sequence samples stored in the replay buffer.
+capacity: 0
+
+# Number of on-policy training steps to collect before replay starts.
+warmup_steps: 0
+
+# Number of extra actor mini-batches to replay per step.
+replay_mini_batch_multiplier: 0
+
+# Quality metric used to prioritize samples.
+quality_metric: seq_reward
+
+# Exponential weight applied to normalized quality scores.
+quality_alpha: 1.0
+
+# Exponential decay horizon for staleness weighting.
+staleness_horizon: 200
+
+# Uniform exploration mixture added to priority sampling.
+uniform_mix: 0.2
+
+# Drop samples older than this many training steps.
+max_age_steps: 500
+
+# Store replay tensors on CPU instead of keeping their original device.
+cpu_offload: true
