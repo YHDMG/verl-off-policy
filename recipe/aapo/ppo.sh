@@ -5,9 +5,6 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export OMP_NUM_THREADS=1
 
 export RAY_NAMESPACE=verl
-export RAY_worker_register_timeout_seconds=120
-export RAY_health_check_timeout_ms=60000
-export RAY_health_check_period_ms=10000
 export RAY_ignore_unhandled_errors=1
 
 export MASTER_ADDR=127.0.0.1
@@ -38,7 +35,7 @@ export HYDRA_FULL_ERROR=1
 
 # ================================ Project configuration ================================
 project_name='off-policy-grpo'
-exp_name='grpo-qwen3-1.7b-buffer-test'
+exp_name='ppo-qwen3-1.7b-buffer-test'
 
 # ================================ Paths ================================
 model_path='/home/cxy/.cache/modelscope/hub/models/Qwen/Qwen3-1.7B'
@@ -60,13 +57,15 @@ sp_size=1
 fsdp_size=8
 
 # ================================ Algorithm parameters ================================
-adv_estimator='grpo'
+adv_estimator='gae'
 loss_mode='vanilla'
 loss_agg_mode='token-mean'
+critic_enable=True
+critic_lr=5e-6
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
+use_kl_loss=True
 kl_loss_coef=0.001
 kl_loss_type='low_var_kl'
 
@@ -96,7 +95,7 @@ off_policy_capacity_steps=10
 
 # ================================ Response length parameters ================================
 max_prompt_length=1024
-max_response_length=$((1024 * 4))
+max_response_length=$((1024 * 7))
 
 # ================================ Sampling parameters ================================
 temperature=1.0
@@ -113,12 +112,12 @@ actor_offload=False
 rollout_gpu_memory_utilization=0.8
 
 # ================================ Batch parameters ================================
-train_prompt_bsz=16
-n_resp_per_prompt=8
-ppo_mini_batch_size=4
-ppo_micro_batch_size_per_gpu=1
-rollout_log_prob_micro_batch_size_per_gpu=1
-ref_log_prob_micro_batch_size_per_gpu=1
+train_prompt_bsz=32
+n_resp_per_prompt=1
+ppo_mini_batch_size=16
+ppo_micro_batch_size_per_gpu=2
+rollout_log_prob_micro_batch_size_per_gpu=2
+ref_log_prob_micro_batch_size_per_gpu=2
 
 # Keep roughly `off_policy_capacity_steps` historical training steps in replay.
 off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps))
@@ -136,7 +135,7 @@ reward_manager='dapo'
 
 rollout_model_len=$((max_prompt_length + max_response_length))
 actor_ppo_max_token_len=$((rollout_model_len * 2))
-infer_ppo_max_token_len=$((rollout_model_len * 2))
+infer_ppo_max_token_len=$((rollout_model_len * 3))
 
 python3 -m recipe.aapo.main_aapo \
     algorithm.adv_estimator="${adv_estimator}" \
@@ -171,6 +170,8 @@ python3 -m recipe.aapo.main_aapo \
     algorithm.off_policy.max_age_steps="${off_policy_max_age_steps}" \
     algorithm.off_policy.zero_adv_epsilon="${off_policy_zero_adv_epsilon}" \
     algorithm.off_policy.cpu_offload="${off_policy_cpu_offload}" \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.ref.strategy=fsdp2 \
     actor_rollout_ref.actor.use_kl_loss="${use_kl_loss}" \
     actor_rollout_ref.actor.kl_loss_coef="${kl_loss_coef}" \
     actor_rollout_ref.actor.kl_loss_type="${kl_loss_type}" \
@@ -198,7 +199,7 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.fsdp_config.fsdp_size="${fsdp_size}" \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size="${sp_size}" \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.calculate_log_probs=False \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.gpu_memory_utilization="${rollout_gpu_memory_utilization}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${gen_tp}" \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -209,7 +210,7 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.rollout.top_p="${top_p}" \
     actor_rollout_ref.rollout.top_k="${top_k}" \
     actor_rollout_ref.rollout.val_kwargs.temperature="${val_temperature}" \
-    actor_rollout_ref.rollout.val_kwargs.n="${n_resp_per_prompt}" \
+    actor_rollout_ref.rollout.val_kwargs.n=8 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.top_p="${val_top_p}" \
     actor_rollout_ref.rollout.val_kwargs.top_k="${val_top_k}" \
@@ -236,4 +237,20 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.rollout.prompt_length="${max_prompt_length}" \
     actor_rollout_ref.rollout.response_length="${max_response_length}" \
     actor_rollout_ref.rollout.max_model_len="${rollout_model_len}" \
+    critic.enable=True \
+    critic.strategy=fsdp2 \
+    critic.model.path="${model_path}" \
+    critic.model.use_remove_padding=True \
+    critic.model.enable_gradient_checkpointing=True \
+    critic.optim.lr=5e-6 \
+    critic.optim.weight_decay=0.0 \
+    critic.ppo_mini_batch_size="${ppo_mini_batch_size}" \
+    critic.ppo_micro_batch_size_per_gpu="${ppo_micro_batch_size_per_gpu}" \
+    critic.ppo_max_token_len_per_gpu="${actor_ppo_max_token_len}" \
+    critic.forward_micro_batch_size_per_gpu="${ppo_micro_batch_size_per_gpu}" \
+    critic.model.fsdp_config.param_offload=False \
+    critic.model.fsdp_config.optimizer_offload=False \
+    critic.model.fsdp_config.offload_policy=False \
+    critic.model.fsdp_config.fsdp_size="${fsdp_size}" \
+    critic.ulysses_sequence_parallel_size="${sp_size}" \
     "$@"

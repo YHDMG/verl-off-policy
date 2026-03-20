@@ -578,11 +578,18 @@ class OffPolicyConfig(BaseConfig):
     capacity: int = 0
     warmup_steps: int = 0
     replay_mini_batch_multiplier: int = 0
+    replay_schedule_type: str = "cosine_decay"
+    replay_start_ratio: float = 1.0
+    replay_end_ratio: float = 0.25
+    replay_anneal_steps: int = 0
     quality_metric: str = "seq_reward"
     quality_alpha: float = 1.0
+    late_quality_alpha_multiplier: float = 2.0
     staleness_horizon: int = 200
     uniform_mix: float = 0.2
+    late_uniform_mix: float = 0.05
     max_age_steps: int = 500
+    zero_adv_epsilon: float = 1e-6
     cpu_offload: bool = True
 
 

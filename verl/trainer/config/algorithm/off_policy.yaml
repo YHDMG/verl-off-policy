@@ -13,11 +13,26 @@ warmup_steps: 0
 # Number of extra actor mini-batches to replay per step.
 replay_mini_batch_multiplier: 0
 
+# Replay schedule type. Only cosine_decay is supported in v1.
+replay_schedule_type: cosine_decay
+
+# Replay ratio multiplier at the beginning of training.
+replay_start_ratio: 1.0
+
+# Replay ratio multiplier at the end of training.
+replay_end_ratio: 0.25
+
+# Number of steps used for replay ratio annealing. Uses total training steps if <= 0.
+replay_anneal_steps: 0
+
 # Quality metric used to prioritize samples.
 quality_metric: seq_reward
 
 # Exponential weight applied to normalized quality scores.
 quality_alpha: 1.0
+
+# Multiplicative boost applied to quality_alpha near the end of training.
+late_quality_alpha_multiplier: 2.0
 
 # Exponential decay horizon for staleness weighting.
 staleness_horizon: 200
@@ -25,8 +40,14 @@ staleness_horizon: 200
 # Uniform exploration mixture added to priority sampling.
 uniform_mix: 0.2
 
+# Uniform exploration mixture used near the end of training.
+late_uniform_mix: 0.05
+
 # Drop samples older than this many training steps.
 max_age_steps: 500
+
+# Skip storing prompt groups whose advantages are all numerically zero.
+zero_adv_epsilon: 1e-6
 
 # Store replay tensors on CPU instead of keeping their original device.
 cpu_offload: true

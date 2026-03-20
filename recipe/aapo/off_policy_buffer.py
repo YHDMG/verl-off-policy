@@ -28,14 +28,17 @@ OFF_POLICY_BATCH_KEYS = (
     "input_ids",
     "attention_mask",
     "position_ids",
+    "prompts",
     "responses",
     "response_mask",
     "old_log_probs",
     "advantages",
+    "returns",
+    "values",
     "token_level_scores",
     "token_level_rewards",
 )
-OFF_POLICY_OPTIONAL_BATCH_KEYS = ("rollout_log_probs", "ref_log_prob")
+OFF_POLICY_OPTIONAL_BATCH_KEYS = ("rollout_log_probs", "ref_log_prob", "rm_scores", "dummy_tensor")
 OFF_POLICY_NON_TENSOR_KEYS = ("uid", "multi_modal_inputs")
 
 
@@ -49,6 +52,12 @@ def compute_replay_batch_size(config: OffPolicyConfig, actor_mini_batch_size: in
 
 @dataclass
 class OffPolicySampleMetrics:
+    metrics: dict[str, float]
+    batch: Optional[DataProto]
+
+
+@dataclass
+class OffPolicyAddMetrics:
     metrics: dict[str, float]
     batch: Optional[DataProto]
 
@@ -85,10 +94,13 @@ class OffPolicyReplayBuffer:
     def empty_metrics(self, requested_batch_size: int) -> dict[str, float]:
         return self._empty_metrics(requested_batch_size)
 
-    def add_batch(self, batch: DataProto, global_step: int) -> None:
+    def add_batch(self, batch: DataProto, global_step: int) -> dict[str, float]:
         selected = self._select_replay_fields(batch)
-        if len(selected) == 0:
-            return
+        filtered_output = self._filter_zero_adv_groups(selected)
+        metrics = filtered_output.metrics
+        selected = filtered_output.batch
+        if selected is None or len(selected) == 0:
+            return metrics
 
         if self.pool is None:
             self._lazy_init(selected)
@@ -123,8 +135,15 @@ class OffPolicyReplayBuffer:
 
         self.position = (self.position + block_size) % self.capacity
         self.size = min(self.size + block_size, self.capacity)
+        return metrics
 
-    def sample_batch(self, batch_size: int, current_step: int) -> OffPolicySampleMetrics:
+    def sample_batch(
+        self,
+        batch_size: int,
+        current_step: int,
+        quality_alpha: Optional[float] = None,
+        uniform_mix: Optional[float] = None,
+    ) -> OffPolicySampleMetrics:
         metrics = self._empty_metrics(batch_size)
         if batch_size <= 0 or self.size == 0:
             return OffPolicySampleMetrics(metrics=metrics, batch=None)
@@ -135,8 +154,8 @@ class OffPolicyReplayBuffer:
             return OffPolicySampleMetrics(metrics=metrics, batch=None)
 
         ages = current_step - self.source_steps[valid_indices]
-        priorities = self._compute_priorities(valid_indices, ages)
-        probabilities = self._mix_uniform(priorities)
+        priorities = self._compute_priorities(valid_indices, ages, quality_alpha=quality_alpha)
+        probabilities = self._mix_uniform(priorities, uniform_mix=uniform_mix)
 
         sampled_indices = np.random.choice(valid_indices, size=batch_size, replace=False, p=probabilities)
         sample_positions = np.searchsorted(valid_indices, sampled_indices)
@@ -165,6 +184,59 @@ class OffPolicyReplayBuffer:
         non_tensor_keys = [key for key in OFF_POLICY_NON_TENSOR_KEYS if key in batch.non_tensor_batch]
         return batch.select(batch_keys=batch_keys, non_tensor_batch_keys=non_tensor_keys, deepcopy=True)
 
+    def _filter_zero_adv_groups(self, batch: DataProto) -> OffPolicyAddMetrics:
+        total_sequences = len(batch)
+        metrics = {
+            "off_policy/skipped_zero_adv_groups": 0.0,
+            "off_policy/skipped_zero_adv_sequences": 0.0,
+            "off_policy/accepted_sequences": float(total_sequences),
+            "off_policy/accepted_ratio": 1.0 if total_sequences > 0 else 0.0,
+        }
+        if total_sequences == 0:
+            return OffPolicyAddMetrics(metrics=metrics, batch=None)
+        if "advantages" not in batch.batch.keys() or "response_mask" not in batch.batch.keys():
+            return OffPolicyAddMetrics(metrics=metrics, batch=batch)
+
+        advantages = batch.batch["advantages"].detach().to(torch.float32)
+        response_mask = batch.batch["response_mask"].detach().to(torch.float32)
+        seq_adv_abs_max = (advantages.abs() * response_mask).amax(dim=-1).cpu().numpy()
+
+        uid_values = batch.non_tensor_batch.get("uid")
+        if uid_values is None:
+            uid_values = np.arange(total_sequences, dtype=np.int64)
+
+        group_to_indices: dict[object, list[int]] = {}
+        for idx, uid in enumerate(uid_values):
+            group_key = self._normalize_group_key(uid)
+            group_to_indices.setdefault(group_key, []).append(idx)
+
+        accepted_mask = np.ones(total_sequences, dtype=bool)
+        skipped_groups = 0
+        skipped_sequences = 0
+        zero_adv_epsilon = float(self.config.zero_adv_epsilon)
+
+        for indices in group_to_indices.values():
+            group_adv_abs_max = seq_adv_abs_max[indices]
+            if np.all(group_adv_abs_max <= zero_adv_epsilon):
+                accepted_mask[np.asarray(indices, dtype=np.int64)] = False
+                skipped_groups += 1
+                skipped_sequences += len(indices)
+
+        accepted_indices = np.flatnonzero(accepted_mask)
+        metrics.update(
+            {
+                "off_policy/skipped_zero_adv_groups": float(skipped_groups),
+                "off_policy/skipped_zero_adv_sequences": float(skipped_sequences),
+                "off_policy/accepted_sequences": float(accepted_indices.size),
+                "off_policy/accepted_ratio": accepted_indices.size / float(max(total_sequences, 1)),
+            }
+        )
+        if accepted_indices.size == 0:
+            return OffPolicyAddMetrics(metrics=metrics, batch=None)
+
+        filtered_batch = batch.select_idxs(torch.as_tensor(accepted_indices, dtype=torch.long))
+        return OffPolicyAddMetrics(metrics=metrics, batch=filtered_batch)
+
     def _lazy_init(self, sample: DataProto) -> None:
         device = self.storage_device if self.storage_device is not None else next(iter(sample.batch.values())).device
         self.pool = TensorDict(
@@ -192,8 +264,15 @@ class OffPolicyReplayBuffer:
         filled_mask = self.source_steps[candidates] >= 0
         return candidates[filled_mask & age_mask]
 
-    def _compute_priorities(self, valid_indices: np.ndarray, ages: np.ndarray) -> np.ndarray:
-        quality_term = np.exp(float(self.config.quality_alpha) * self.quality_z[valid_indices])
+    def _compute_priorities(
+        self,
+        valid_indices: np.ndarray,
+        ages: np.ndarray,
+        quality_alpha: Optional[float] = None,
+    ) -> np.ndarray:
+        if quality_alpha is None:
+            quality_alpha = float(self.config.quality_alpha)
+        quality_term = np.exp(float(quality_alpha) * self.quality_z[valid_indices])
         if int(self.config.staleness_horizon) > 0:
             staleness_term = np.exp(-ages / float(self.config.staleness_horizon))
         else:
@@ -202,9 +281,10 @@ class OffPolicyReplayBuffer:
         priorities = np.clip(priorities, a_min=1e-8, a_max=None)
         return priorities.astype(np.float64, copy=False)
 
-    def _mix_uniform(self, priorities: np.ndarray) -> np.ndarray:
+    def _mix_uniform(self, priorities: np.ndarray, uniform_mix: Optional[float] = None) -> np.ndarray:
         normalized = priorities / priorities.sum()
-        uniform_mix = float(self.config.uniform_mix)
+        if uniform_mix is None:
+            uniform_mix = float(self.config.uniform_mix)
         if uniform_mix <= 0:
             return normalized
         uniform = np.full_like(normalized, 1.0 / normalized.size, dtype=np.float64)
@@ -253,3 +333,15 @@ class OffPolicyReplayBuffer:
     def _entropy(probabilities: np.ndarray) -> float:
         safe_prob = np.clip(probabilities, a_min=1e-12, a_max=None)
         return float(-(safe_prob * np.log(safe_prob)).sum())
+
+    @staticmethod
+    def _normalize_group_key(uid: object) -> object:
+        if isinstance(uid, np.ndarray):
+            if uid.ndim == 0:
+                return uid.item()
+            return tuple(uid.tolist())
+        if isinstance(uid, np.generic):
+            return uid.item()
+        if isinstance(uid, list):
+            return tuple(uid)
+        return uid
