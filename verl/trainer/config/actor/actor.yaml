@@ -75,6 +75,48 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Number of entropy observations kept for HEAR's EMA statistics
+  entropy_history_size: 50
+
+  # EMA coefficient for HEAR entropy statistics
+  entropy_ema_beta: 0.1
+
+  # Enable history-based ratio correction in HEAR
+  enable_correction: true
+
+  # Maximum history size used by HEAR correction
+  correction_history_size: 10
+
+  # Upper trigger threshold for HEAR correction
+  correction_trigger_high: 20.0
+
+  # Enable high-entropy guard in HEAR
+  enable_high_entropy_guard: false
+
+  # Minimum target coverage for selected high-entropy tokens
+  high_entropy_guard_min_ratio: 0.2
+
+  # Entropy quantile used when select_ratio is not provided
+  high_entropy_guard_quantile: 0.8
+
+  # Explicit ratio of high-entropy tokens selected by the guard
+  high_entropy_guard_select_ratio: null
+
+  # Maximum number of guard expansion iterations
+  high_entropy_guard_max_iters: 5
+
+  # Lower-bound expansion step used by the high-entropy guard
+  high_entropy_guard_low_step: 0.01
+
+  # Upper-bound expansion step used by the high-entropy guard
+  high_entropy_guard_high_step: 0.01
+
+  # Optional minimum lower bound allowed by the high-entropy guard
+  high_entropy_guard_lower_min: null
+
+  # Optional maximum upper bound allowed by the high-entropy guard
+  high_entropy_guard_upper_max: null
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
@@ -87,6 +129,9 @@ loss_scale_factor: null
 
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
+
+# Ratio used by dp actor high-entropy token reuse on the last PPO epoch
+high_entropy_ratio: 0.2
 
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false

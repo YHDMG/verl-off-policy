@@ -74,12 +74,15 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg'.
+        loss_mode (str): Loss function mode. Options include 'vanilla', 'clip_cov', 'kl_cov',
+            'gpg', 'hear', and other registered policy losses.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        enable_high_entropy_guard (bool): Protect a subset of high-entropy tokens from over-clipping.
+        enable_correction (bool): Enable history-based ratio correction in HEAR.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
@@ -89,6 +92,20 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    entropy_history_size: int = 50
+    entropy_ema_beta: float = 0.1
+    enable_correction: bool = True
+    correction_history_size: int = 10
+    correction_trigger_high: float = 20.0
+    enable_high_entropy_guard: bool = False
+    high_entropy_guard_min_ratio: float = 0.2
+    high_entropy_guard_quantile: float = 0.8
+    high_entropy_guard_select_ratio: Optional[float] = None
+    high_entropy_guard_max_iters: int = 5
+    high_entropy_guard_low_step: float = 0.01
+    high_entropy_guard_high_step: float = 0.01
+    high_entropy_guard_lower_min: Optional[float] = None
+    high_entropy_guard_upper_max: Optional[float] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 
@@ -115,6 +132,7 @@ class ActorConfig(BaseConfig):
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
+        high_entropy_ratio (float): Ratio used by dp actor high-entropy token reuse on the last PPO epoch.
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.
@@ -156,6 +174,7 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
+    high_entropy_ratio: float = 0.2
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False

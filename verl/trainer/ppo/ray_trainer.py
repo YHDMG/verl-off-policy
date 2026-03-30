@@ -1170,7 +1170,10 @@ class RayPPOTrainer:
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
-            calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            actor_loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+            calculate_entropy = (
+                self.config.actor_rollout_ref.actor.entropy_coeff != 0.0 or actor_loss_mode == "hear"
+            )
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs

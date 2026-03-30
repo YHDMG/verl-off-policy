@@ -20,9 +20,10 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from enum import Enum
-from typing import Any, Callable, Optional
+import os
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
@@ -34,6 +35,404 @@ from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
 
+_hear_ratio_history: Dict[str, deque] = {}
+# 临时存储动态clip参数的字典（key是config对象的id）
+_hear_metric_storage: Dict[int, Dict[str, Any]] = {}
+# 熵历史队列，用于基于熵的动态裁剪调整
+_hear_entropy_history: Dict[str, deque] = {}
+# 熵EMA状态，用于指数平滑统计
+_hear_entropy_ema_state: Dict[str, Dict[str, float]] = {}
+# 基于设备的目标熵与平滑熵（用于自适应裁剪）
+# 用于跟踪绘图step的全局计数器（按设备区分）
+# 用于存储历史ratio数据（用于绘图）：{device_id: [(step, original_ratios, corrected_ratios), ...]}
+
+
+def get_hear_metrics(policy_loss_config: Any, metric_prefix: str = "actor/hear_") -> dict[str, float]:
+    """Collect auxiliary metrics produced by HEAR."""
+    if policy_loss_config is None:
+        return {}
+
+    config_id = id(policy_loss_config)
+    if config_id not in _hear_metric_storage:
+        return {}
+
+    clip_info = _hear_metric_storage[config_id]
+    metrics: dict[str, float] = {}
+
+    simple_metric_map = {
+        "clip_low": f"{metric_prefix}clip_low",
+        "clip_high": f"{metric_prefix}clip_high",
+        "entropy_mean": f"{metric_prefix}entropy_mean",
+        "entropy_ema_mean": f"{metric_prefix}entropy_ema_mean",
+        "entropy_ema_std": f"{metric_prefix}entropy_ema_std",
+        "high_entropy_coverage": f"{metric_prefix}high_entropy_coverage",
+    }
+    for source_key, target_key in simple_metric_map.items():
+        value = clip_info.get(source_key)
+        if value is not None:
+            metrics[target_key] = float(value)
+
+    for key, value in clip_info.items():
+        if value is None:
+            continue
+        if key.startswith(("high_entropy_guard/", "high_entropy/", "ratio/")):
+            metrics[f"{metric_prefix}{key}"] = float(value)
+
+    return metrics
+
+
+def get_ratio_history(device_id: str, max_size: int = 10) -> deque:
+
+    """
+    获取或创建指定设备的历史ratio队列
+    Args:
+        device_id: 设备标识符（如 "cuda:0"）
+        max_size: 队列最大长度
+    Returns:
+        该设备对应的历史队列
+    """
+    if device_id not in _hear_ratio_history:
+        _hear_ratio_history[device_id] = deque(maxlen=max_size)
+    return _hear_ratio_history[device_id]
+
+@deprecated("Legacy sequence-level helper kept for backward compatibility.")
+def adaptive_ratio_correction(
+    seq_importance_ratio: torch.Tensor,
+    advantages: torch.Tensor, 
+    response_mask: torch.Tensor,
+    history_queue: deque,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    trigger_high: float = 10.0
+) -> torch.Tensor:
+
+
+    if len(history_queue) == 0:
+
+        return seq_importance_ratio
+    positive_adv_mask = (advantages > 0) & (response_mask > 0)
+    if not torch.any(positive_adv_mask):
+        return seq_importance_ratio
+
+    # ============ 计算历史统计量 ============
+
+    history_list = list(history_queue)
+    hist_max = max(history_list)  # 历史最大健康ratio
+    hist_min = min(history_list)
+    hist_mean = sum(history_list) / len(history_list)
+
+    # 历史标准差和范围
+    hist_variance = sum((x - hist_mean) ** 2 for x in history_list) / len(history_list)
+    hist_std = (hist_variance ** 0.5) if hist_variance > 0 else 0.1
+    hist_range = hist_max - hist_min if len(history_list) > 1 else hist_std
+    extreme_threshold = hist_max * trigger_high
+
+    # ============ 筛选需要矫正的样本 ============
+    needs_correction = (
+        positive_adv_mask &
+        (seq_importance_ratio > (1 + clip_ratio_high)) &  # 超出clip上界
+        (seq_importance_ratio > hist_max) &  # 超过历史最大健康ratio
+        (seq_importance_ratio < extreme_threshold)  # 未极端偏离
+    )
+
+    if not torch.any(needs_correction):
+        return seq_importance_ratio
+    corrected_ratio = seq_importance_ratio.clone()
+    current_ratios = seq_importance_ratio[needs_correction]
+
+    # ============ 误差计算与自适应压缩 ============
+
+    errors = current_ratios - hist_max
+    normalized_errors = errors / (hist_range + 1e-6)
+    gate = torch.sigmoid(2.0 - normalized_errors)
+    compression_rate = gate * 0.5 + (1 - gate) * 0.1  # 压缩保留率[0.2, 0.7]
+    corrected_errors = errors * compression_rate
+    corrected_ratio[needs_correction] = hist_max + corrected_errors
+    return corrected_ratio
+
+
+def adaptive_ratio_correction_token(
+    token_importance_ratio: torch.Tensor,
+    advantages: torch.Tensor, 
+    response_mask: torch.Tensor,
+    history_queue: deque,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    trigger_high: float = 30.0
+
+) -> torch.Tensor:
+
+    """
+    基于历史健康ratio的自适应误差矫正（token-level版本）
+    与序列级别版本类似，但适用于token-level的importance ratio
+    """
+    if len(history_queue) == 0:
+        return token_importance_ratio
+    positive_adv_mask = (advantages > 0) & (response_mask > 0)
+    if not torch.any(positive_adv_mask):
+        return token_importance_ratio
+
+    # ============ 计算历史统计量 ============
+
+    history_list = list(history_queue)
+    hist_max = max(history_list)  # 历史最大健康ratio
+    hist_min = min(history_list)
+    hist_mean = sum(history_list) / len(history_list)
+    # 历史标准差和范围
+    hist_variance = sum((x - hist_mean) ** 2 for x in history_list) / len(history_list)
+    hist_std = (hist_variance ** 0.5) if hist_variance > 0 else 0.1
+
+    hist_range = hist_max - hist_min if len(history_list) > 1 else hist_std
+
+    # 极端阈值：基于历史最大健康ratio
+    extreme_threshold = hist_max * trigger_high
+    # ============ 筛选需要矫正的样本 ============
+
+    needs_correction = (
+        positive_adv_mask &
+        (token_importance_ratio > (1 + clip_ratio_high)) &  # 超出clip上界
+        (token_importance_ratio > hist_max) &  # 超过历史最大健康ratio
+        (token_importance_ratio < extreme_threshold)  # 未极端偏离
+    )
+    if not torch.any(needs_correction):
+        return token_importance_ratio
+    corrected_ratio = token_importance_ratio.clone()
+    current_ratios = token_importance_ratio[needs_correction]
+
+    # ============ 误差计算与自适应压缩 ============
+    errors = current_ratios - hist_max
+    # 归一化error（相对于历史健康ratio的范围）
+    normalized_errors = errors / (hist_range + 1e-6)
+    # 自适应门控：error越小，保留越多
+    gate = torch.sigmoid(2.0 - normalized_errors)
+    compression_rate = gate * 0.5 + (1 - gate) * 0.1  # 压缩保留率[0.2, 0.7]
+    # 压缩后的误差
+    corrected_errors = errors * compression_rate
+    # 矫正后的ratio = 历史最大健康ratio + 压缩后的误差
+    corrected_ratio[needs_correction] = hist_max + corrected_errors
+    return corrected_ratio
+
+@deprecated("Legacy helper kept for backward compatibility.")
+def _compute_effective_advantage_token(
+    ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    clip_low: float,
+    clip_high: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    clip_min = ratio.new_tensor(clip_low)
+    clip_max = ratio.new_tensor(clip_high)
+    ratio_pos = torch.minimum(ratio, clip_max)
+    ratio_neg = torch.maximum(ratio, clip_min)
+    effective_ratio = torch.where(advantages >= 0, ratio_pos, ratio_neg)
+    effective_adv = effective_ratio * advantages * response_mask
+    pos_contrib = effective_adv.clamp(min=0).sum()
+    neg_contrib = (-effective_adv.clamp(max=0)).sum()
+
+    # 计算正负优势比例
+    if neg_contrib <= eps:
+        pos_neg_ratio = pos_contrib / ratio.new_tensor(eps)
+    else:
+        pos_neg_ratio = pos_contrib / (neg_contrib + ratio.new_tensor(eps))
+    return effective_adv, pos_neg_ratio
+
+def _select_high_entropy_tokens(
+    token_entropy: torch.Tensor | None,
+    response_mask: torch.Tensor,
+    target_ratio: float,
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+
+    stats = {
+        "high_entropy/selected_ratio": 0.0,
+        "high_entropy/threshold": 0.0,
+        "high_entropy/entropy_selected_mean": 0.0,
+        "high_entropy/entropy_all_mean": 0.0,
+        "high_entropy/total_tokens": 0.0,
+        "high_entropy/selected_tokens": 0.0,
+    }
+    if token_entropy is None:
+        return None, stats
+    valid_mask = response_mask > 0
+    valid_token_count = valid_mask.sum()
+    stats["high_entropy/total_tokens"] = float(valid_token_count.item())
+    if valid_token_count.item() == 0:
+        return None, stats
+    entropy_values = token_entropy[valid_mask]
+    if entropy_values.numel() == 0:
+        return None, stats
+
+    ratio = float(np.clip(target_ratio, 0.0, 1.0))
+    k = max(1, int(entropy_values.numel() * ratio))
+    k = min(k, entropy_values.numel())
+    topk_values = torch.topk(entropy_values, k).values
+    threshold_value = topk_values[-1]
+    high_entropy_mask = (token_entropy >= threshold_value) & valid_mask
+    selected_count = high_entropy_mask.sum()
+
+    if selected_count.item() > 0:
+        stats["high_entropy/selected_ratio"] = float(selected_count.item() / valid_token_count.item())
+        stats["high_entropy/threshold"] = float(threshold_value.item())
+        stats["high_entropy/entropy_selected_mean"] = float(token_entropy[high_entropy_mask].mean().item())
+    stats["high_entropy/entropy_all_mean"] = float(entropy_values.mean().item())
+    stats["high_entropy/selected_tokens"] = float(selected_count.item())
+    return high_entropy_mask, stats
+
+
+def _compute_high_entropy_coverage(
+    ratio: torch.Tensor,
+    response_mask: torch.Tensor,
+    high_entropy_mask: torch.Tensor | None,
+    low_bound: float,
+    high_bound: float,
+) -> float | None:
+    if high_entropy_mask is None:
+        return None
+
+    valid_mask = response_mask > 0
+    selected_mask = high_entropy_mask & valid_mask
+    selected_count = selected_mask.sum()
+    if selected_count.item() == 0:
+        return 0.0
+
+    unclipped = (ratio >= low_bound) & (ratio <= high_bound) & selected_mask
+    coverage = unclipped.sum().float() / selected_count.float()
+    return float(coverage.item())
+
+
+def _adjust_clip_for_high_entropy_tokens(
+    corrected_ratio: torch.Tensor,
+    response_mask: torch.Tensor,
+    high_entropy_mask: torch.Tensor | None,
+    ratio_low_cur: float,
+    ratio_high_cur: float,
+    ratio_low_min: float,
+    ratio_high_max: float,
+    target_ratio: float,
+    max_iters: int,
+    low_step: float,
+    high_step: float,
+) -> tuple[float, float, float | None, dict[str, float]]:
+
+    stats = {
+
+        "high_entropy_guard/coverage_before": 0.0,
+        "high_entropy_guard/coverage_after": 0.0,
+        "high_entropy_guard/clip_low_before": ratio_low_cur,
+        "high_entropy_guard/clip_high_before": ratio_high_cur,
+        "high_entropy_guard/clip_low_after": ratio_low_cur,
+        "high_entropy_guard/clip_high_after": ratio_high_cur,
+        "high_entropy_guard/clip_range_before": ratio_high_cur - ratio_low_cur,
+        "high_entropy_guard/clip_range_after": ratio_high_cur - ratio_low_cur,
+        "high_entropy_guard/iterations_used": 0.0,
+        "high_entropy_guard/target_ratio": target_ratio,
+        "high_entropy_guard/clip_low_delta": 0.0,
+        "high_entropy_guard/clip_high_delta": 0.0,
+        "high_entropy_guard/coverage_delta": 0.0,
+
+    }
+
+    ratio_low_initial = ratio_low_cur
+    ratio_high_initial = ratio_high_cur
+
+    if high_entropy_mask is None or target_ratio <= 0.0:
+        # 设置 delta 指标（即使没有变化也要记录）
+        stats["high_entropy_guard/clip_low_delta"] = 0.0
+        stats["high_entropy_guard/clip_high_delta"] = 0.0
+        stats["high_entropy_guard/coverage_delta"] = 0.0
+        return ratio_low_cur, ratio_high_cur, None, stats
+
+    valid_mask = response_mask > 0
+    total_valid = valid_mask.sum()
+    if total_valid.item() == 0:
+        # 设置 delta 指标（即使没有变化也要记录）
+        stats["high_entropy_guard/clip_low_delta"] = 0.0
+
+        stats["high_entropy_guard/clip_high_delta"] = 0.0
+        stats["high_entropy_guard/coverage_delta"] = 0.0
+        return ratio_low_cur, ratio_high_cur, None, stats
+
+    high_entropy_mask = high_entropy_mask & valid_mask
+    high_entropy_count = high_entropy_mask.sum()
+    if high_entropy_count.item() == 0:
+        stats["high_entropy_guard/coverage_before"] = 0.0
+        stats["high_entropy_guard/coverage_after"] = 0.0
+        # 设置 delta 指标（即使没有变化也要记录）
+        stats["high_entropy_guard/clip_low_delta"] = 0.0
+        stats["high_entropy_guard/clip_high_delta"] = 0.0
+        stats["high_entropy_guard/coverage_delta"] = 0.0
+        return ratio_low_cur, ratio_high_cur, 0.0, stats
+
+    coverage_before = _compute_high_entropy_coverage(
+        ratio=corrected_ratio,
+        response_mask=response_mask,
+        high_entropy_mask=high_entropy_mask,
+        low_bound=ratio_low_cur,
+        high_bound=ratio_high_cur,
+    )
+    assert coverage_before is not None
+    stats["high_entropy_guard/coverage_before"] = float(coverage_before)
+    stats["high_entropy_guard/clip_low_before"] = float(ratio_low_cur)
+    stats["high_entropy_guard/clip_high_before"] = float(ratio_high_cur)
+    stats["high_entropy_guard/clip_range_before"] = float(ratio_high_cur - ratio_low_cur)
+    if coverage_before >= target_ratio:
+        stats["high_entropy_guard/coverage_after"] = float(coverage_before)
+        stats["high_entropy_guard/clip_low_after"] = float(ratio_low_cur)
+        stats["high_entropy_guard/clip_high_after"] = float(ratio_high_cur)
+        stats["high_entropy_guard/clip_range_after"] = float(ratio_high_cur - ratio_low_cur)
+        # 设置 delta 指标（即使没有变化也要记录）
+
+        stats["high_entropy_guard/clip_low_delta"] = float(ratio_low_cur - ratio_low_initial)
+        stats["high_entropy_guard/clip_high_delta"] = float(ratio_high_cur - ratio_high_initial)
+        stats["high_entropy_guard/coverage_delta"] = 0.0  # coverage 没有变化
+        return ratio_low_cur, ratio_high_cur, float(coverage_before), stats
+
+    low_step = float(max(low_step, 0.0))
+    high_step = float(max(high_step, 0.0))
+    ratio_low_min = float(min(ratio_low_min, ratio_low_cur))
+    ratio_high_max = float(max(ratio_high_max, ratio_high_cur))
+
+    achieved = coverage_before
+    iterations_used = 0
+    for iteration in range(max_iters):
+        changed = False
+        if low_step > 0.0 and ratio_low_cur > ratio_low_min:
+            new_low = max(ratio_low_cur - low_step, ratio_low_min)
+            if new_low < ratio_low_cur:
+                ratio_low_cur = new_low
+                changed = True
+
+        if high_step > 0.0 and ratio_high_cur < ratio_high_max:
+            new_high = min(ratio_high_cur + high_step, ratio_high_max)
+            if new_high > ratio_high_cur:
+                ratio_high_cur = new_high
+                changed = True
+        if not changed:
+            break
+
+        coverage = _compute_high_entropy_coverage(
+            ratio=corrected_ratio,
+            response_mask=response_mask,
+            high_entropy_mask=high_entropy_mask,
+            low_bound=ratio_low_cur,
+            high_bound=ratio_high_cur,
+        )
+        assert coverage is not None
+        achieved = coverage
+        iterations_used = iteration + 1
+        if achieved >= target_ratio:
+            break
+
+    stats["high_entropy_guard/coverage_after"] = float(achieved)
+    stats["high_entropy_guard/clip_low_after"] = float(ratio_low_cur)
+    stats["high_entropy_guard/clip_high_after"] = float(ratio_high_cur)
+    stats["high_entropy_guard/clip_range_after"] = float(ratio_high_cur - ratio_low_cur)
+    stats["high_entropy_guard/iterations_used"] = float(iterations_used)
+    stats["high_entropy_guard/clip_low_delta"] = float(ratio_low_cur - ratio_low_initial)
+    stats["high_entropy_guard/clip_high_delta"] = float(ratio_high_cur - ratio_high_initial)
+    stats["high_entropy_guard/coverage_delta"] = float(achieved - coverage_before)
+    return ratio_low_cur, ratio_high_cur, float(achieved), stats
 PolicyLossFn = Callable[
     [
         torch.Tensor,  # old_log_prob
@@ -1358,6 +1757,326 @@ def compute_policy_loss_vanilla(
     pg_loss = agg_loss(
         loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+@register_policy_loss("hear")
+def compute_policy_loss_hear(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    entropy: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    HEAR policy loss.
+
+    Features:
+    1. Token-level importance ratio with decoupled clip bounds.
+    2. History-based correction on positive-advantage tokens.
+    3. Optional high-entropy guard that relaxes the clip window when needed.
+    4. Token-mean compatible loss aggregation.
+    """
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    # Read the standard PPO clip bounds used as HEAR's starting window.
+    clip_ratio = getattr(config, "clip_ratio", 0.2)
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get("clip_ratio_c", 3.0)
+    
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    # History correction parameters.
+    enable_correction = True
+    correction_trigger_high = float(os.environ.get("VERL_HEAR_TRIGGER_HIGH", "20.0"))
+    correction_history_size = int(os.environ.get("VERL_HEAR_HISTORY_SIZE", "10"))
+    pl_config = config.policy_loss if hasattr(config, "policy_loss") and config.policy_loss is not None else None
+    if pl_config is not None:
+        enable_correction = bool(getattr(pl_config, "enable_correction", enable_correction))
+        correction_trigger_high = float(
+            getattr(pl_config, "correction_trigger_high", correction_trigger_high)
+        )
+        correction_history_size = int(
+            getattr(pl_config, "correction_history_size", correction_history_size)
+        )   
+
+    correction_trigger_high = max(correction_trigger_high, 1.0)
+    correction_history_size = max(correction_history_size, 1)
+    
+    # ============ 熵统计和记录 ============
+    entropy_mean_value = None
+
+    if entropy is not None:
+        entropy_mean = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode="token-mean")
+        entropy_mean_value = entropy_mean.item()
+        
+        device_id = str(log_prob.device)
+        entropy_history_size = getattr(pl_config, "entropy_history_size", 50) if pl_config else 50
+        if device_id not in _hear_entropy_history:
+            _hear_entropy_history[device_id] = deque(maxlen=entropy_history_size)
+            _hear_entropy_ema_state[device_id] = {"mean": entropy_mean_value, "std": 1.0}
+        
+        entropy_history = _hear_entropy_history[device_id]
+        ema_state = _hear_entropy_ema_state[device_id]
+        entropy_history.append(entropy_mean_value)
+        
+        if len(entropy_history) == 1:
+            ema_state["mean"] = entropy_mean_value
+            ema_state["std"] = 1.0
+        else:
+            entropy_ema_beta = getattr(pl_config, "entropy_ema_beta", 0.1) if pl_config else 0.1
+            ema_state["mean"] = (1 - entropy_ema_beta) * ema_state["mean"] + entropy_ema_beta * entropy_mean_value
+            if len(entropy_history) >= 5:
+                hist_list = list(entropy_history)
+                current_std = (sum((x - ema_state["mean"]) ** 2 for x in hist_list) / len(hist_list)) ** 0.5
+                ema_state["std"] = (1 - entropy_ema_beta) * ema_state["std"] + entropy_ema_beta * current_std
+
+    # Compute token-level importance ratio.
+    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    token_importance_ratio = torch.exp(negative_approx_kl)
+
+    # ============ 初始化clip范围 ============
+    default_low = 1.0 - clip_ratio_low
+    default_high = 1.0 + clip_ratio_high
+    ratio_low_cur = default_low
+    ratio_high_cur = default_high
+
+    # ============ 其他参数初始化 ============
+    high_entropy_coverage = None
+    high_entropy_stats = None
+    high_entropy_guard_stats = None
+    high_entropy_mask = None
+    high_entropy_guard_enabled = False
+    high_entropy_target_ratio = 0.2
+    high_entropy_quantile = 0.8
+    high_entropy_selection_ratio = None
+    high_entropy_max_iters = 5
+    high_entropy_low_step = 0.01
+    high_entropy_high_step = 0.01
+    high_entropy_low_min = default_low * 0.5
+    high_entropy_high_max = default_high * 2.0
+    guard_lower_min = None
+    guard_upper_max = None
+    if pl_config is not None:
+        # 高熵守卫参数
+        high_entropy_guard_enabled = getattr(pl_config, "enable_high_entropy_guard", False)
+        high_entropy_target_ratio = getattr(pl_config, "high_entropy_guard_min_ratio", high_entropy_target_ratio)
+        high_entropy_quantile = getattr(pl_config, "high_entropy_guard_quantile", high_entropy_quantile)
+        high_entropy_selection_ratio = getattr(pl_config, "high_entropy_guard_select_ratio", high_entropy_selection_ratio)
+        high_entropy_max_iters = int(getattr(pl_config, "high_entropy_guard_max_iters", high_entropy_max_iters))
+        high_entropy_low_step = getattr(pl_config, "high_entropy_guard_low_step", high_entropy_low_step)
+        high_entropy_high_step = getattr(pl_config, "high_entropy_guard_high_step", high_entropy_high_step)
+        guard_lower_min = getattr(pl_config, "high_entropy_guard_lower_min", None)
+        guard_upper_max = getattr(pl_config, "high_entropy_guard_upper_max", None)
+
+    if guard_lower_min is not None:
+        high_entropy_low_min = float(guard_lower_min)
+    if guard_upper_max is not None:
+        high_entropy_high_max = float(guard_upper_max)
+
+    # ============ 初始化 corrected_ratio（在高熵守卫之前，确保变量已定义） ============
+    # 如果 enable_correction 为 False，先使用原始 ratio，后续会在历史矫正块中更新
+    corrected_ratio = token_importance_ratio
+    
+    # ============ 高熵守卫 ============
+    high_entropy_mask = None  # 初始化为None，用于后续ratio保存时区分token类型
+    if high_entropy_guard_enabled and high_entropy_target_ratio > 0.0:
+        selection_ratio = (
+            float(high_entropy_selection_ratio)
+            if high_entropy_selection_ratio is not None
+            else float(max(1e-6, min(1.0, 1.0 - float(high_entropy_quantile))))
+        )
+        high_entropy_mask, high_entropy_stats = _select_high_entropy_tokens(
+            token_entropy=entropy,
+            response_mask=response_mask,
+            target_ratio=selection_ratio,
+        )
+        ratio_low_cur, ratio_high_cur, high_entropy_coverage, high_entropy_guard_stats = _adjust_clip_for_high_entropy_tokens(
+            corrected_ratio=corrected_ratio,
+            response_mask=response_mask,
+            high_entropy_mask=high_entropy_mask,
+            ratio_low_cur=ratio_low_cur,
+            ratio_high_cur=ratio_high_cur,
+            ratio_low_min=float(high_entropy_low_min),
+            ratio_high_max=float(high_entropy_high_max),
+            target_ratio=float(high_entropy_target_ratio),
+            max_iters=max(int(high_entropy_max_iters), 0),
+            low_step=float(high_entropy_low_step),
+            high_step=float(high_entropy_high_step),
+        )
+
+    final_clip_low = ratio_low_cur
+    final_clip_high = ratio_high_cur
+    history_queue = None
+    # ============ 【第二步】历史矫正（使用动态调整后的clip边界） ============
+    if enable_correction:
+        device_id = str(log_prob.device)
+        history_queue = get_ratio_history(device_id, max_size=correction_history_size)
+        # 使用动态调整后的边界（转换为偏移量形式）
+        effective_clip_low = final_clip_low - 1.0   # 例如 1.2 -> 0.2
+        effective_clip_high = final_clip_high - 1.0  # 例如 1.2 -> 0.2
+
+        corrected_ratio = adaptive_ratio_correction_token(
+            token_importance_ratio=token_importance_ratio,
+            advantages=advantages,
+            response_mask=response_mask,
+            history_queue=history_queue,
+            clip_ratio_low=effective_clip_low,
+            clip_ratio_high=effective_clip_high,
+            trigger_high=correction_trigger_high
+        )
+
+
+    # Compute the HEAR loss with decoupled clip bounds and dual-clip fallback.
+    if high_entropy_mask is not None:
+        high_entropy_coverage = _compute_high_entropy_coverage(
+            ratio=corrected_ratio,
+            response_mask=response_mask,
+            high_entropy_mask=high_entropy_mask,
+            low_bound=final_clip_low,
+            high_bound=final_clip_high,
+        )
+        if high_entropy_stats is not None and high_entropy_coverage is not None:
+            high_entropy_stats["high_entropy/coverage_after_clip"] = float(high_entropy_coverage)
+        if high_entropy_guard_stats is not None and high_entropy_coverage is not None:
+            coverage_before = float(high_entropy_guard_stats["high_entropy_guard/coverage_before"])
+            high_entropy_guard_stats["high_entropy_guard/coverage_after"] = float(high_entropy_coverage)
+            high_entropy_guard_stats["high_entropy_guard/coverage_delta"] = float(
+                high_entropy_coverage - coverage_before
+            )
+
+    pg_losses1 = -advantages * corrected_ratio
+    pg_losses2 = -advantages * torch.clamp(corrected_ratio, final_clip_low, final_clip_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    # Dual clip fallback for negative-advantage tokens.
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+    )
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        **config.global_batch_info,
+    )
+
+    # ============ 存储指标（包括新增的正负优势ratio统计） ============
+    if pl_config is not None:
+        config_id = id(pl_config)
+        storage_dict = {
+            "clip_low": float(final_clip_low),
+            "clip_high": float(final_clip_high),
+        }
+
+        # 动态裁剪指标
+
+        # 高熵相关指标
+        if high_entropy_coverage is not None:
+            storage_dict["high_entropy_coverage"] = float(high_entropy_coverage)
+        if high_entropy_stats is not None:
+            for key, value in high_entropy_stats.items():
+                storage_dict[key] = float(value)
+        if high_entropy_guard_stats is not None:
+            for key, value in high_entropy_guard_stats.items():
+                storage_dict[key] = float(value)
+
+        # 熵相关指标
+        if entropy_mean_value is not None:
+            storage_dict["entropy_mean"] = entropy_mean_value
+            device_id = str(log_prob.device)
+            if device_id in _hear_entropy_ema_state:
+                ema_state = _hear_entropy_ema_state[device_id]
+                storage_dict["entropy_ema_mean"] = ema_state["mean"]
+                storage_dict["entropy_ema_std"] = ema_state["std"]
+
+        # ============ 【新增】正负优势的ratio统计 ============
+        with torch.no_grad():
+            valid_mask = response_mask > 0
+            pos_adv_mask = (advantages > 0) & valid_mask
+            neg_adv_mask = (advantages < 0) & valid_mask
+
+            # 正优势token的ratio统计
+            if pos_adv_mask.any():
+                pos_ratios = token_importance_ratio[pos_adv_mask]
+                storage_dict["ratio/pos_adv_mean"] = float(pos_ratios.mean().item())
+                storage_dict["ratio/pos_adv_std"] = float(pos_ratios.std().item())
+                storage_dict["ratio/pos_adv_max"] = float(pos_ratios.max().item())
+                storage_dict["ratio/pos_adv_min"] = float(pos_ratios.min().item())
+                storage_dict["ratio/pos_adv_exceed_high"] = float(
+                    (pos_ratios > final_clip_high).float().mean().item()
+                )
+                storage_dict["ratio/pos_adv_count"] = float(pos_adv_mask.sum().item())
+
+            # 负优势token的ratio统计
+            if neg_adv_mask.any():
+                neg_ratios = token_importance_ratio[neg_adv_mask]
+                storage_dict["ratio/neg_adv_mean"] = float(neg_ratios.mean().item())
+                storage_dict["ratio/neg_adv_std"] = float(neg_ratios.std().item())
+                storage_dict["ratio/neg_adv_max"] = float(neg_ratios.max().item())
+                storage_dict["ratio/neg_adv_min"] = float(neg_ratios.min().item())
+                storage_dict["ratio/neg_adv_below_low"] = float(
+                    (neg_ratios < final_clip_low).float().mean().item()
+                )
+                storage_dict["ratio/neg_adv_count"] = float(neg_adv_mask.sum().item())
+
+            # 矫正前后的ratio差异（如果启用了矫正）
+            if enable_correction:
+                correction_diff = (corrected_ratio - token_importance_ratio).abs()
+                corrected_mask = correction_diff > 1e-6
+                if corrected_mask.any():
+                    # 使用 "count" 后缀，reduce_metrics 会自动求和（而不是平均）
+                    storage_dict["ratio/correction_count"] = float(corrected_mask.sum().item())
+                    storage_dict["ratio/correction_mean_diff"] = float(
+                        correction_diff[corrected_mask].mean().item()
+                    )
+                else:
+                    storage_dict["ratio/correction_count"] = 0.0
+                    storage_dict["ratio/correction_mean_diff"] = 0.0
+            else:
+                storage_dict["ratio/correction_count"] = 0.0
+                storage_dict["ratio/correction_mean_diff"] = 0.0
+
+        _hear_metric_storage[config_id] = storage_dict
+
+    # ============ 更新历史队列 ============
+    if enable_correction and history_queue is not None:
+        with torch.no_grad():
+            positive_mask = (advantages > 0) & (response_mask > 0)
+            not_clipped_mask = (
+                (token_importance_ratio >= final_clip_low) &
+                (token_importance_ratio <= final_clip_high)
+            )
+            healthy_mask = positive_mask & not_clipped_mask
+            if torch.any(healthy_mask):
+                healthy_ratio_mean = (
+                    (token_importance_ratio * healthy_mask).sum() / healthy_mask.sum()
+                ).item()
+                history_queue.append(healthy_ratio_mean)
+
+    # ============ 计算辅助指标 ============
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),

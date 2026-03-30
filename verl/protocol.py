@@ -36,7 +36,7 @@ from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
 from verl.utils.device import get_device_id, get_torch_device
-from verl.utils.py_functional import list_of_dict_to_dict_of_list, union_two_dict
+from verl.utils.py_functional import append_to_dict, list_of_dict_to_dict_of_list, union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
 
 __all__ = ["DataProto", "union_tensor_dict"]
@@ -952,9 +952,13 @@ class DataProto:
                         else:
                             merged_meta_info[k] = v
 
-            # Flatten list of dicts to dict of lists for consistent metrics structure
+            # Merge per-worker metrics with metric-aware flattening:
+            # scalar values are appended, existing metric lists are extended.
             if all_metrics:
-                merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+                merged_metrics = {}
+                for metric_dict in all_metrics:
+                    append_to_dict(merged_metrics, metric_dict)
+                merged_meta_info["metrics"] = merged_metrics
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)

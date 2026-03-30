@@ -22,6 +22,29 @@ import numpy as np
 import torch
 
 
+def _normalize_metric_value(key: str, value: Any) -> Any:
+    """Convert scalar-like metric values to plain numbers and reject sequences."""
+    if isinstance(value, Metric):
+        return value.aggregate()
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"Metric '{key}' contains a non-scalar tensor with shape {tuple(value.shape)}.")
+        return value.detach().item()
+    if isinstance(value, np.ndarray):
+        if value.size != 1:
+            raise ValueError(f"Metric '{key}' contains a non-scalar ndarray with shape {value.shape}.")
+        return value.item()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError(
+                f"Metric '{key}' contains a nested sequence of length {len(value)} instead of scalar values."
+            )
+        return _normalize_metric_value(key, value[0])
+    return value
+
+
 def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, Any]:
     """
     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
@@ -49,12 +72,16 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
     for key, val in metrics.items():
         if isinstance(val, Metric):
             metrics[key] = val.aggregate()
-        elif "max" in key:
-            metrics[key] = np.max(val)
-        elif "min" in key:
-            metrics[key] = np.min(val)
+        elif isinstance(val, (list, tuple)):
+            normalized_values = [_normalize_metric_value(key, item) for item in val]
+            if "max" in key:
+                metrics[key] = np.max(normalized_values)
+            elif "min" in key:
+                metrics[key] = np.min(normalized_values)
+            else:
+                metrics[key] = np.mean(normalized_values)
         else:
-            metrics[key] = np.mean(val)
+            metrics[key] = _normalize_metric_value(key, val)
     return metrics
 
 

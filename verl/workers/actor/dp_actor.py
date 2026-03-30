@@ -27,7 +27,12 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    get_hear_metrics,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -97,6 +102,10 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+        self.high_entropy_ratio = max(0.0, min(1.0, float(self.config.get("high_entropy_ratio", 0.2))))
+        if torch.distributed.get_rank() == 0:
+            print(f"{role} high_entropy_ratio={self.high_entropy_ratio}")
+
         # Sum of squared probabilities computation (for optimal_token_baseline)
         # Only initialize if calculate_sum_pi_squared config is enabled
         if self.config.get("calculate_sum_pi_squared", False):
@@ -109,6 +118,95 @@ class DataParallelPPOActor(BasePPOActor):
                 "calculate_sum_pi_squared is not supported with "
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
+
+    def _apply_high_entropy_mask(
+        self, entropy: torch.Tensor, original_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        stats = {
+            "high_entropy/selected_ratio": 0.0,
+            "high_entropy/threshold": 0.0,
+            "high_entropy/entropy_selected_mean": 0.0,
+            "high_entropy/entropy_all_mean": 0.0,
+            "high_entropy/total_tokens": 0.0,
+            "high_entropy/selected_tokens": 0.0,
+        }
+        valid_positions = original_mask.bool()
+        valid_entropies = entropy[valid_positions]
+        if valid_entropies.numel() == 0 or self.high_entropy_ratio <= 0.0:
+            return original_mask, stats
+
+        k = max(1, int(valid_entropies.numel() * self.high_entropy_ratio))
+        k = min(k, valid_entropies.numel())
+        threshold_value = torch.topk(valid_entropies, k).values[-1]
+        high_entropy_mask = (entropy >= threshold_value) & valid_positions
+
+        selected_count = float(high_entropy_mask.sum().item())
+        total_count = float(valid_positions.sum().item())
+        stats.update(
+            {
+                "high_entropy/selected_ratio": selected_count / total_count if total_count > 0 else 0.0,
+                "high_entropy/threshold": float(threshold_value.item()),
+                "high_entropy/entropy_selected_mean": float(entropy[high_entropy_mask].mean().item())
+                if selected_count > 0
+                else 0.0,
+                "high_entropy/entropy_all_mean": float(valid_entropies.mean().item()),
+                "high_entropy/total_tokens": total_count,
+                "high_entropy/selected_tokens": selected_count,
+            }
+        )
+        return high_entropy_mask.to(dtype=original_mask.dtype), stats
+
+    def _apply_positive_reward_high_entropy_mask(
+        self,
+        entropy: torch.Tensor,
+        original_mask: torch.Tensor,
+        trajectory_rewards: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if trajectory_rewards is None:
+            return self._apply_high_entropy_mask(entropy, original_mask)
+
+        positive_reward_sequences = trajectory_rewards > 0
+        stats = {
+            "high_entropy/positive_reward_sequences": float(positive_reward_sequences.sum().item()),
+            "high_entropy/positive_reward_sequence_ratio": float(positive_reward_sequences.float().mean().item())
+            if positive_reward_sequences.numel() > 0
+            else 0.0,
+        }
+        valid_positions = original_mask.bool() & positive_reward_sequences.unsqueeze(-1)
+        valid_entropies = entropy[valid_positions]
+        if valid_entropies.numel() == 0 or self.high_entropy_ratio <= 0.0:
+            stats.update(
+                {
+                    "high_entropy/selected_ratio": 0.0,
+                    "high_entropy/threshold": 0.0,
+                    "high_entropy/entropy_selected_mean": 0.0,
+                    "high_entropy/entropy_all_mean": 0.0,
+                    "high_entropy/total_tokens": 0.0,
+                    "high_entropy/selected_tokens": 0.0,
+                }
+            )
+            return torch.zeros_like(original_mask), stats
+
+        k = max(1, int(valid_entropies.numel() * self.high_entropy_ratio))
+        k = min(k, valid_entropies.numel())
+        threshold_value = torch.topk(valid_entropies, k).values[-1]
+        high_entropy_mask = (entropy >= threshold_value) & valid_positions
+
+        selected_count = float(high_entropy_mask.sum().item())
+        total_count = float(valid_positions.sum().item())
+        stats.update(
+            {
+                "high_entropy/selected_ratio": selected_count / total_count if total_count > 0 else 0.0,
+                "high_entropy/threshold": float(threshold_value.item()),
+                "high_entropy/entropy_selected_mean": float(entropy[high_entropy_mask].mean().item())
+                if selected_count > 0
+                else 0.0,
+                "high_entropy/entropy_all_mean": float(valid_entropies.mean().item()),
+                "high_entropy/total_tokens": total_count,
+                "high_entropy/selected_tokens": selected_count,
+            }
+        )
+        return high_entropy_mask.to(dtype=original_mask.dtype), stats
 
     def _forward_micro_batch(
         self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
@@ -530,6 +628,10 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        if "token_level_rewards" in data.batch.keys():
+            select_keys.append("token_level_rewards")
+        elif "token_level_scores" in data.batch.keys():
+            select_keys.append("token_level_scores")
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
@@ -553,7 +655,17 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
         }
-        for _ in range(self.config.ppo_epochs):
+        for epoch_idx in range(self.config.ppo_epochs):
+            use_high_entropy_only = (
+                self.high_entropy_ratio > 0.0
+                and self.config.ppo_epochs % 2 == 0
+                and epoch_idx == self.config.ppo_epochs - 1
+            )
+            if use_high_entropy_only and torch.distributed.get_rank() == 0:
+                print(
+                    f"Epoch {epoch_idx + 1}/{self.config.ppo_epochs}: "
+                    f"using high-entropy token update (ratio={self.high_entropy_ratio})"
+                )
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -570,14 +682,18 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
-                    response_mask = model_inputs["response_mask"]
+                    original_response_mask = model_inputs["response_mask"]
+                    response_mask = original_response_mask
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
+                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or (
+                        loss_mode == "hear"
+                    ) or use_high_entropy_only
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -591,6 +707,18 @@ class DataParallelPPOActor(BasePPOActor):
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
 
+                    if use_high_entropy_only and entropy is not None:
+                        trajectory_rewards = None
+                        if "token_level_rewards" in model_inputs:
+                            trajectory_rewards = model_inputs["token_level_rewards"].sum(dim=-1)
+                        elif "token_level_scores" in model_inputs:
+                            trajectory_rewards = model_inputs["token_level_scores"].sum(dim=-1)
+
+                        response_mask, high_entropy_stats = self._apply_positive_reward_high_entropy_mask(
+                            entropy, original_response_mask, trajectory_rewards
+                        )
+                        micro_batch_metrics.update({f"actor/{key}": value for key, value in high_entropy_stats.items()})
+
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
@@ -600,7 +728,6 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
                     # Extract pre-computed rollout correction weights if present
@@ -612,16 +739,27 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    policy_loss_kwargs = {
+                        "old_log_prob": old_log_prob,
+                        "log_prob": log_prob,
+                        "advantages": advantages,
+                        "response_mask": response_mask,
+                        "loss_agg_mode": loss_agg_mode,
+                        "config": self.config,
+                        "rollout_is_weights": rollout_is_weights,
+                    }
+                    if loss_mode == "hear":
+                        try:
+                            self.config._temp_global_steps = data.meta_info.get("global_steps")
+                            self.config._temp_response_ids = model_inputs.get("responses")
+                        except Exception:
+                            pass
+                        policy_loss_kwargs["entropy"] = entropy
+
+                    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
                     micro_batch_metrics.update(pg_metrics)
+                    if loss_mode == "hear":
+                        micro_batch_metrics.update(get_hear_metrics(self.config.policy_loss))
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
