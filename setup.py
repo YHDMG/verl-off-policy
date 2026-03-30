@@ -49,6 +49,7 @@ PRIME_REQUIRES = ["pyext"]
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]
 MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
+ANALYSIS_REQUIRES = ["matplotlib", "polars", "jupyterlab", "ipykernel"]
 VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.8.5,<=0.12.0"]
 TRTLLM_REQUIRES = ["tensorrt-llm>=1.2.0rc6"]
 SGLANG_REQUIRES = [
@@ -65,6 +66,7 @@ extras_require = {
     "geo": GEO_REQUIRES,
     "gpu": GPU_REQUIRES,
     "math": MATH_REQUIRES,
+    "analysis": ANALYSIS_REQUIRES,
     "vllm": VLLM_REQUIRES,
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,

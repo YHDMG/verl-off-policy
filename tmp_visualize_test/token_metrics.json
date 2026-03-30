@@ -1,0 +1,1 @@
+[{"sample_id": "s1", "decode_id": 0, "position": 0, "token_text": "A", "entropy": 0.2, "logprob": -0.1, "segment_tag": "reasoning"}, {"sample_id": "s1", "decode_id": 0, "position": 1, "token_text": " B", "entropy": 0.9, "logprob": -0.9, "segment_tag": "answer"}]

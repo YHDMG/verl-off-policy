@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Entropy Heatmap | sample=s1 decode=0</title>
+  <style>
+    body { font-family: 'Segoe UI', 'PingFang SC', sans-serif; margin: 24px; background: #fffaf5; color: #1f2937; }
+    h1 { margin: 0 0 16px 0; font-size: 28px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+    .card { background: white; border: 1px solid #f2d3b4; border-radius: 16px; padding: 16px 18px; box-shadow: 0 8px 24px rgba(120, 53, 15, 0.06); }
+    .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #9a3412; margin-bottom: 10px; }
+    .prompt { line-height: 1.6; white-space: normal; }
+    .meta { display: flex; flex-wrap: wrap; gap: 14px 18px; font-size: 14px; }
+    .meta-key { color: #9a3412; font-weight: 600; }
+    .legend { display: flex; align-items: center; gap: 12px; font-size: 13px; }
+    .legend-bar { width: 280px; height: 14px; border-radius: 999px; background: linear-gradient(90deg, hsl(14 85% 96%), hsl(14 85% 36%)); border: 1px solid rgba(154, 52, 18, 0.2); }
+    .tokens { line-height: 2.1; font-size: 20px; word-break: break-word; }
+    .token { display: inline; padding: 0.12em 0.18em; border-radius: 6px; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div>
+      <h1>Entropy Heatmap | sample=s1 decode=0</h1>
+    </div>
+    <div class="card"><div class="label">Prompt</div><div class="prompt">Q</div></div>
+    <div class="card">
+      <div class="label">Summary</div>
+      <div class="meta"><div><span class="meta-key">sample_id</span>: s1</div><div><span class="meta-key">decode_id</span>: 0</div><div><span class="meta-key">is_correct</span>: True</div><div><span class="meta-key">extracted_answer</span>: B</div><div><span class="meta-key">verification_method</span>: rule</div></div>
+    </div>
+    <div class="card">
+      <div class="label">Entropy Scale</div>
+      <div class="legend"><span>0.200</span><div class="legend-bar"></div><span>0.900</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Token Heatmap</div>
+      <div class="tokens"><span class="token" title="pos=0 | entropy=0.2000 | logprob=-0.1000 | segment=reasoning" style="background:hsl(14 85% 96.0%);color:#111827;">A</span><span class="token" title="pos=1 | entropy=0.9000 | logprob=-0.9000 | segment=answer" style="background:hsl(14 85% 36.0%);color:#f9fafb;">&nbsp;B</span></div>
+    </div>
+  </div>
+</body>
+</html>

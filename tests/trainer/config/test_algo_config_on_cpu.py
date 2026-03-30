@@ -19,6 +19,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.config import AlgoConfig, KLControlConfig
+from verl.trainer.config.algorithm import OffPolicyConfig
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
@@ -101,6 +102,18 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertFalse(config.use_kl_in_reward)  # default value
         self.assertEqual(config.kl_penalty, "kl")  # default value
         self.assertFalse(config.use_pf_ppo)  # default value
+
+    def test_off_policy_experiment_defaults(self):
+        config = OffPolicyConfig()
+
+        self.assertEqual(config.replay_priority_mode, "reward_only")
+        self.assertEqual(config.mismatch_candidate_batch_multiplier, 1)
+        self.assertEqual(config.mismatch_priority_weight, 1.0)
+        self.assertEqual(config.mismatch_entropy_topk_tokens, 8)
+        self.assertFalse(config.entropy_minimax_enable)
+        self.assertEqual(config.entropy_minimax_low_seq_ratio, 0.25)
+        self.assertEqual(config.entropy_minimax_high_token_ratio, 0.2)
+        self.assertEqual(config.entropy_minimax_min_tokens, 1)
 
     def test_get_method_backward_compatibility(self):
         """Test the get method for backward compatibility."""

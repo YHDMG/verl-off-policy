@@ -19,6 +19,8 @@ def _make_trainer(
     use_dynamic_bsz: bool = True,
     actor_mini_batch_size: int = 2,
     n_gpus_per_node: int = 8,
+    replay_priority_mode: str = "reward_only",
+    entropy_minimax_enable: bool = False,
 ):
     trainer = RayAAPOTrainer.__new__(RayAAPOTrainer)
     trainer.config = OmegaConf.create(
@@ -37,6 +39,14 @@ def _make_trainer(
                     "quality_metric": "seq_reward",
                     "quality_alpha": 0.5,
                     "late_quality_alpha_multiplier": 2.0,
+                    "replay_priority_mode": replay_priority_mode,
+                    "mismatch_candidate_batch_multiplier": 2,
+                    "mismatch_priority_weight": 1.0,
+                    "mismatch_entropy_topk_tokens": 1,
+                    "entropy_minimax_enable": entropy_minimax_enable,
+                    "entropy_minimax_low_seq_ratio": 0.5,
+                    "entropy_minimax_high_token_ratio": 0.5,
+                    "entropy_minimax_min_tokens": 1,
                     "staleness_horizon": 10,
                     "uniform_mix": 0.2,
                     "late_uniform_mix": 0.05,
@@ -166,3 +176,61 @@ def test_off_policy_buffer_selects_ppo_related_fields():
     assert "values" in selected.batch.keys()
     assert "rm_scores" in selected.batch.keys()
     assert "dummy_tensor" in selected.batch.keys()
+
+
+def test_reward_mismatch_reranking_prefers_high_reward_low_mismatch_candidates():
+    trainer = _make_trainer(AdvantageEstimator.GAE, replay_priority_mode="reward_mismatch")
+    trainer._init_off_policy_replay()
+
+    replay_batch = DataProto.from_dict(
+        tensors={
+            "response_mask": torch.ones(3, 2, dtype=torch.float32),
+            "rollout_log_probs": torch.tensor(
+                [[-0.1, -0.1], [-0.1, -0.1], [-0.1, -0.1]], dtype=torch.float32
+            ),
+            "token_level_scores": torch.tensor(
+                [[2.0, 2.0], [1.0, 1.0], [1.5, 1.5]], dtype=torch.float32
+            ),
+        },
+        non_tensors={"uid": np.asarray(["a", "b", "c"], dtype=object)},
+    )
+    replay_features = {
+        "current_log_probs": torch.tensor(
+            [[-0.15, -0.15], [-2.0, -2.0], [-0.2, -0.2]], dtype=torch.float32
+        ),
+        "current_entropys": torch.tensor(
+            [[0.1, 0.9], [0.1, 0.9], [0.1, 0.9]], dtype=torch.float32
+        ),
+    }
+
+    selected_batch, _, metrics = trainer._rescore_replay_batch_with_mismatch(
+        replay_batch=replay_batch,
+        replay_features=replay_features,
+        final_batch_size=2,
+    )
+
+    assert list(selected_batch.non_tensor_batch["uid"]) == ["a", "c"]
+    assert metrics["off_policy/replay_candidate_batch_size"] == 3.0
+
+
+def test_entropy_minimax_keeps_high_entropy_tokens_from_low_entropy_sequences():
+    trainer = _make_trainer(AdvantageEstimator.GAE, entropy_minimax_enable=True)
+    trainer._init_off_policy_replay()
+
+    replay_batch = DataProto.from_dict(
+        tensors={
+            "response_mask": torch.ones(2, 4, dtype=torch.float32),
+        },
+        non_tensors={"uid": np.asarray(["a", "b"], dtype=object)},
+    )
+    replay_features = {
+        "current_entropys": torch.tensor(
+            [[0.1, 0.2, 0.9, 0.8], [0.9, 0.8, 0.7, 0.6]], dtype=torch.float32
+        )
+    }
+
+    masked_batch, metrics = trainer._apply_entropy_minimax_mask(replay_batch, replay_features)
+
+    assert torch.equal(masked_batch.batch["response_mask"][0], torch.tensor([0.0, 0.0, 1.0, 1.0]))
+    assert torch.equal(masked_batch.batch["response_mask"][1], torch.tensor([0.0, 0.0, 0.0, 0.0]))
+    assert metrics["off_policy/minimax_selected_seq_fraction"] == 1.0 / 2.0

@@ -115,9 +115,9 @@ rollout_gpu_memory_utilization=0.8
 train_prompt_bsz=32
 n_resp_per_prompt=1
 ppo_mini_batch_size=16
-ppo_micro_batch_size_per_gpu=2
-rollout_log_prob_micro_batch_size_per_gpu=2
-ref_log_prob_micro_batch_size_per_gpu=2
+ppo_micro_batch_size_per_gpu=1
+rollout_log_prob_micro_batch_size_per_gpu=1
+ref_log_prob_micro_batch_size_per_gpu=1
 
 # Keep roughly `off_policy_capacity_steps` historical training steps in replay.
 off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps))

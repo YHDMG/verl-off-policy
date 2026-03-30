@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -xeuo pipefail
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1
 export OMP_NUM_THREADS=1
 
 export RAY_NAMESPACE=verl
@@ -13,9 +13,8 @@ export RAY_ignore_unhandled_errors=1
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29517
 
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_LAUNCH_MODE=GROUP
 
 export NCCL_SHM_DISABLE=0
 export NCCL_P2P_DISABLE=0
@@ -54,10 +53,10 @@ resume_from_path=''
 # For dual-socket / dual-NUMA 8-GPU machines, prefer one NUMA island first:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3  or  CUDA_VISIBLE_DEVICES=4,5,6,7
 nnodes=1
-n_gpus_per_node=8
-gen_tp=1
+n_gpus_per_node=2
+gen_tp=2
 sp_size=1
-fsdp_size=8
+fsdp_size=2
 
 # ================================ Algorithm parameters ================================
 adv_estimator='grpo'
@@ -102,7 +101,7 @@ max_response_length=$((1024 * 4))
 temperature=1.0
 top_p=1.0
 top_k=-1
-val_temperature=1.0
+val_temperature=0.6
 val_top_p=0.7
 val_top_k=-1
 
@@ -110,10 +109,10 @@ val_top_k=-1
 use_dynamic_bsz=False
 ref_offload=True
 actor_offload=False
-rollout_gpu_memory_utilization=0.8
+rollout_gpu_memory_utilization=0.6
 
 # ================================ Batch parameters ================================
-train_prompt_bsz=16
+train_prompt_bsz=8
 n_resp_per_prompt=8
 ppo_mini_batch_size=4
 ppo_micro_batch_size_per_gpu=1
@@ -128,7 +127,7 @@ test_freq=10
 save_freq=-1
 total_epochs=1
 total_training_steps=500
-val_before_train=True
+val_before_train=False
 
 # ================================ Misc ================================
 trainer_logger='["console","swanlab"]'
@@ -198,7 +197,7 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.fsdp_config.fsdp_size="${fsdp_size}" \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size="${sp_size}" \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.calculate_log_probs=False \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.gpu_memory_utilization="${rollout_gpu_memory_utilization}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${gen_tp}" \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
