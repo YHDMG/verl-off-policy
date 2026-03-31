@@ -69,13 +69,13 @@ def get_hear_metrics(policy_loss_config: Any, metric_prefix: str = "actor/hear_"
     for source_key, target_key in simple_metric_map.items():
         value = clip_info.get(source_key)
         if value is not None:
-            metrics[target_key] = float(value)
+            metrics[target_key] = value
 
     for key, value in clip_info.items():
         if value is None:
             continue
         if key.startswith(("high_entropy_guard/", "high_entropy/", "ratio/")):
-            metrics[f"{metric_prefix}{key}"] = float(value)
+            metrics[f"{metric_prefix}{key}"] = value
 
     return metrics
 
@@ -301,6 +301,17 @@ def _compute_high_entropy_coverage(
     unclipped = (ratio >= low_bound) & (ratio <= high_bound) & selected_mask
     coverage = unclipped.sum().float() / selected_count.float()
     return float(coverage.item())
+
+
+def _has_valid_high_entropy_selection(
+    response_mask: torch.Tensor,
+    high_entropy_mask: torch.Tensor | None,
+) -> bool:
+    if high_entropy_mask is None:
+        return False
+
+    valid_mask = response_mask > 0
+    return bool(torch.any(high_entropy_mask & valid_mask).item())
 
 
 def _adjust_clip_for_high_entropy_tokens(
@@ -1882,6 +1893,7 @@ def compute_policy_loss_hear(
     high_entropy_stats = None
     high_entropy_guard_stats = None
     high_entropy_mask = None
+    high_entropy_metrics_valid = False
     high_entropy_guard_enabled = False
     high_entropy_target_ratio = 0.2
     high_entropy_quantile = 0.8
@@ -1931,6 +1943,7 @@ def compute_policy_loss_hear(
             response_mask=response_mask,
             target_ratio=selection_ratio,
         )
+        high_entropy_metrics_valid = _has_valid_high_entropy_selection(response_mask, high_entropy_mask)
         ratio_low_cur, ratio_high_cur, high_entropy_coverage, high_entropy_guard_stats = _adjust_clip_for_high_entropy_tokens(
             corrected_ratio=corrected_ratio,
             response_mask=response_mask,
@@ -1968,7 +1981,7 @@ def compute_policy_loss_hear(
 
 
     # Compute the HEAR loss with decoupled clip bounds and dual-clip fallback.
-    if high_entropy_mask is not None:
+    if high_entropy_metrics_valid:
         high_entropy_coverage = _compute_high_entropy_coverage(
             ratio=corrected_ratio,
             response_mask=response_mask,
@@ -1977,11 +1990,14 @@ def compute_policy_loss_hear(
             high_bound=final_clip_high,
         )
         if high_entropy_stats is not None and high_entropy_coverage is not None:
-            high_entropy_stats["high_entropy/coverage_after_clip"] = float(high_entropy_coverage)
+            high_entropy_stats["high_entropy/coverage_after_clip"] = high_entropy_coverage
             if high_entropy_guard_stats is not None:
-                guard_coverage_after = float(high_entropy_guard_stats["high_entropy_guard/coverage_after"])
+                guard_coverage_before = high_entropy_guard_stats["high_entropy_guard/coverage_before"]
+                guard_coverage_after = high_entropy_guard_stats["high_entropy_guard/coverage_after"]
+                high_entropy_stats["high_entropy/coverage_before_guard"] = guard_coverage_before
                 high_entropy_stats["high_entropy/coverage_after_guard"] = guard_coverage_after
-                high_entropy_stats["high_entropy/coverage_gain_from_correction"] = float(
+                high_entropy_stats["high_entropy/coverage_gain_from_guard"] = guard_coverage_after - guard_coverage_before
+                high_entropy_stats["high_entropy/coverage_gain_from_correction"] = (
                     high_entropy_coverage - guard_coverage_after
                 )
 
@@ -2020,14 +2036,16 @@ def compute_policy_loss_hear(
         # 动态裁剪指标
 
         # 高熵相关指标
-        if high_entropy_coverage is not None:
-            storage_dict["high_entropy_coverage"] = float(high_entropy_coverage)
+        if high_entropy_metrics_valid and high_entropy_coverage is not None:
+            storage_dict["high_entropy_coverage"] = high_entropy_coverage
         if high_entropy_stats is not None:
             for key, value in high_entropy_stats.items():
-                storage_dict[key] = float(value)
-        if high_entropy_guard_stats is not None:
+                if key.startswith("high_entropy/coverage") and not high_entropy_metrics_valid:
+                    continue
+                storage_dict[key] = value
+        if high_entropy_guard_stats is not None and high_entropy_metrics_valid:
             for key, value in high_entropy_guard_stats.items():
-                storage_dict[key] = float(value)
+                storage_dict[key] = value
 
         # 熵相关指标
         if entropy_mean_value is not None:

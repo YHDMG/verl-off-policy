@@ -63,16 +63,17 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # ================================ HEAR parameters ================================
+# The dp-actor reuse path is enabled on the last PPO epoch, so keep ppo_epochs even.
 high_entropy_ratio=0.2
 enable_correction=True
 correction_history_size=10
 correction_trigger_high=20.0
 
 enable_high_entropy_guard=True
-high_entropy_guard_min_ratio=0.2
-high_entropy_guard_quantile=0.8
+# Guard coverage is measured on the selected HEAR token subset, not on all response tokens.
+high_entropy_guard_min_ratio=0.9
 high_entropy_guard_select_ratio=0.2
-high_entropy_guard_max_iters=5
+high_entropy_guard_max_iters=10
 high_entropy_guard_low_step=0.01
 high_entropy_guard_high_step=0.01
 high_entropy_guard_lower_min=0.7
@@ -188,7 +189,6 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.policy_loss.correction_trigger_high="${correction_trigger_high}" \
     actor_rollout_ref.actor.policy_loss.enable_high_entropy_guard="${enable_high_entropy_guard}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_min_ratio="${high_entropy_guard_min_ratio}" \
-    actor_rollout_ref.actor.policy_loss.high_entropy_guard_quantile="${high_entropy_guard_quantile}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_select_ratio="${high_entropy_guard_select_ratio}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_max_iters="${high_entropy_guard_max_iters}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_low_step="${high_entropy_guard_low_step}" \
