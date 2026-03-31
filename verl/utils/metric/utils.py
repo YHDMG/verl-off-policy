@@ -22,6 +22,18 @@ import numpy as np
 import torch
 
 
+def _should_sum_metric_key(key: str) -> bool:
+    return key.endswith(
+        (
+            "/count",
+            "_count",
+            "/total_tokens",
+            "/selected_tokens",
+            "/positive_reward_sequences",
+        )
+    )
+
+
 def _normalize_metric_value(key: str, value: Any) -> Any:
     """Convert scalar-like metric values to plain numbers and reject sequences."""
     if isinstance(value, Metric):
@@ -49,6 +61,7 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
     """
     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
     The reduce operation is determined by the key name:
+    - If the key represents a count-like metric, np.sum is used
     - If the key contains "max", np.max is used
     - If the key contains "min", np.min is used
     - Otherwise, np.mean is used
@@ -74,7 +87,9 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
             metrics[key] = val.aggregate()
         elif isinstance(val, (list, tuple)):
             normalized_values = [_normalize_metric_value(key, item) for item in val]
-            if "max" in key:
+            if _should_sum_metric_key(key):
+                metrics[key] = np.sum(normalized_values)
+            elif "max" in key:
                 metrics[key] = np.max(normalized_values)
             elif "min" in key:
                 metrics[key] = np.min(normalized_values)

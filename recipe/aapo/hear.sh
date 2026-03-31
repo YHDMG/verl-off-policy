@@ -123,6 +123,7 @@ train_prompt_bsz=16
 n_resp_per_prompt=8
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
+ppo_epochs=2
 rollout_log_prob_micro_batch_size_per_gpu=1
 ref_log_prob_micro_batch_size_per_gpu=1
 
@@ -208,6 +209,7 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
+    actor_rollout_ref.actor.ppo_epochs="${ppo_epochs}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${ppo_mini_batch_size}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${ppo_micro_batch_size_per_gpu}" \
     actor_rollout_ref.actor.entropy_coeff=0 \

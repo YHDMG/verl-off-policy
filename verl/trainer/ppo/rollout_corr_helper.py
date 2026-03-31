@@ -1018,6 +1018,9 @@ def compute_rollout_corr_metrics_from_logprobs(
     Returns:
         Dictionary of metrics with "rollout_corr/" prefix
     """
+    if not torch.any(response_mask > 0):
+        return {"rollout_corr/empty_mask_count": 1.0}
+
     # Compute off-policy diagnostic metrics
     offpolicy_metrics = compute_offpolicy_metrics(
         old_log_prob=log_prob,

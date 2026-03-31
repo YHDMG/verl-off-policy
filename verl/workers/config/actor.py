@@ -133,6 +133,7 @@ class ActorConfig(BaseConfig):
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
         high_entropy_ratio (float): Ratio used by dp actor high-entropy token reuse on the last PPO epoch.
+            The reuse path is activated when `ppo_epochs` is even and the final epoch is reserved for it.
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.

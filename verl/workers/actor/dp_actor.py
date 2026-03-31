@@ -718,6 +718,8 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy, original_response_mask, trajectory_rewards
                         )
                         micro_batch_metrics.update({f"actor/{key}": value for key, value in high_entropy_stats.items()})
+                        if response_mask.sum().item() == 0:
+                            micro_batch_metrics["actor/high_entropy/empty_selection_micro_batch_count"] = 1.0
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -808,7 +810,7 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item() if torch.is_tensor(grad_norm) else float(grad_norm)}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

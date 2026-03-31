@@ -22,7 +22,6 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict, deque
 from enum import Enum
-import os
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
@@ -91,8 +90,11 @@ def get_ratio_history(device_id: str, max_size: int = 10) -> deque:
     Returns:
         该设备对应的历史队列
     """
+    max_size = max(int(max_size), 1)
     if device_id not in _hear_ratio_history:
         _hear_ratio_history[device_id] = deque(maxlen=max_size)
+    elif _hear_ratio_history[device_id].maxlen != max_size:
+        _hear_ratio_history[device_id] = deque(_hear_ratio_history[device_id], maxlen=max_size)
     return _hear_ratio_history[device_id]
 
 @deprecated("Legacy sequence-level helper kept for backward compatibility.")
@@ -1562,11 +1564,18 @@ def agg_loss(
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    zero_loss = loss_mat.sum() * 0.0
+
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
             batch_num_tokens = loss_mask.sum()
+        if torch.is_tensor(batch_num_tokens):
+            if batch_num_tokens.item() == 0:
+                return zero_loss
+        elif batch_num_tokens == 0:
+            return zero_loss
         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
     elif loss_agg_mode in ["seq-mean-token-sum", "seq-mean-token-sum-norm"]:
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
@@ -1575,6 +1584,11 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
+        if torch.is_tensor(global_batch_size):
+            if global_batch_size.item() == 0:
+                return zero_loss
+        elif global_batch_size == 0:
+            return zero_loss
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
         if loss_agg_mode == "seq-mean-token-sum-norm":
             if loss_scale_factor is None:
@@ -1589,6 +1603,11 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
+        if torch.is_tensor(global_batch_size):
+            if global_batch_size.item() == 0:
+                return zero_loss
+        elif global_batch_size == 0:
+            return zero_loss
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
@@ -1800,8 +1819,8 @@ def compute_policy_loss_hear(
 
     # History correction parameters.
     enable_correction = True
-    correction_trigger_high = float(os.environ.get("VERL_HEAR_TRIGGER_HIGH", "20.0"))
-    correction_history_size = int(os.environ.get("VERL_HEAR_HISTORY_SIZE", "10"))
+    correction_trigger_high = 20.0
+    correction_history_size = 10
     pl_config = config.policy_loss if hasattr(config, "policy_loss") and config.policy_loss is not None else None
     if pl_config is not None:
         enable_correction = bool(getattr(pl_config, "enable_correction", enable_correction))
@@ -1823,9 +1842,11 @@ def compute_policy_loss_hear(
         entropy_mean_value = entropy_mean.item()
         
         device_id = str(log_prob.device)
-        entropy_history_size = getattr(pl_config, "entropy_history_size", 50) if pl_config else 50
-        if device_id not in _hear_entropy_history:
-            _hear_entropy_history[device_id] = deque(maxlen=entropy_history_size)
+        entropy_history_size = max(int(getattr(pl_config, "entropy_history_size", 50) if pl_config else 50), 1)
+        if device_id not in _hear_entropy_history or _hear_entropy_history[device_id].maxlen != entropy_history_size:
+            existing_history = list(_hear_entropy_history.get(device_id, []))
+            _hear_entropy_history[device_id] = deque(existing_history, maxlen=entropy_history_size)
+        if device_id not in _hear_entropy_ema_state:
             _hear_entropy_ema_state[device_id] = {"mean": entropy_mean_value, "std": 1.0}
         
         entropy_history = _hear_entropy_history[device_id]
@@ -1836,7 +1857,9 @@ def compute_policy_loss_hear(
             ema_state["mean"] = entropy_mean_value
             ema_state["std"] = 1.0
         else:
-            entropy_ema_beta = getattr(pl_config, "entropy_ema_beta", 0.1) if pl_config else 0.1
+            entropy_ema_beta = float(
+                np.clip(getattr(pl_config, "entropy_ema_beta", 0.1) if pl_config else 0.1, 0.0, 1.0)
+            )
             ema_state["mean"] = (1 - entropy_ema_beta) * ema_state["mean"] + entropy_ema_beta * entropy_mean_value
             if len(entropy_history) >= 5:
                 hist_list = list(entropy_history)
@@ -1872,13 +1895,17 @@ def compute_policy_loss_hear(
     guard_upper_max = None
     if pl_config is not None:
         # 高熵守卫参数
-        high_entropy_guard_enabled = getattr(pl_config, "enable_high_entropy_guard", False)
-        high_entropy_target_ratio = getattr(pl_config, "high_entropy_guard_min_ratio", high_entropy_target_ratio)
-        high_entropy_quantile = getattr(pl_config, "high_entropy_guard_quantile", high_entropy_quantile)
+        high_entropy_guard_enabled = bool(getattr(pl_config, "enable_high_entropy_guard", False))
+        high_entropy_target_ratio = float(
+            np.clip(getattr(pl_config, "high_entropy_guard_min_ratio", high_entropy_target_ratio), 0.0, 1.0)
+        )
+        high_entropy_quantile = float(
+            np.clip(getattr(pl_config, "high_entropy_guard_quantile", high_entropy_quantile), 0.0, 1.0)
+        )
         high_entropy_selection_ratio = getattr(pl_config, "high_entropy_guard_select_ratio", high_entropy_selection_ratio)
         high_entropy_max_iters = int(getattr(pl_config, "high_entropy_guard_max_iters", high_entropy_max_iters))
-        high_entropy_low_step = getattr(pl_config, "high_entropy_guard_low_step", high_entropy_low_step)
-        high_entropy_high_step = getattr(pl_config, "high_entropy_guard_high_step", high_entropy_high_step)
+        high_entropy_low_step = float(getattr(pl_config, "high_entropy_guard_low_step", high_entropy_low_step))
+        high_entropy_high_step = float(getattr(pl_config, "high_entropy_guard_high_step", high_entropy_high_step))
         guard_lower_min = getattr(pl_config, "high_entropy_guard_lower_min", None)
         guard_upper_max = getattr(pl_config, "high_entropy_guard_upper_max", None)
 
@@ -1951,12 +1978,12 @@ def compute_policy_loss_hear(
         )
         if high_entropy_stats is not None and high_entropy_coverage is not None:
             high_entropy_stats["high_entropy/coverage_after_clip"] = float(high_entropy_coverage)
-        if high_entropy_guard_stats is not None and high_entropy_coverage is not None:
-            coverage_before = float(high_entropy_guard_stats["high_entropy_guard/coverage_before"])
-            high_entropy_guard_stats["high_entropy_guard/coverage_after"] = float(high_entropy_coverage)
-            high_entropy_guard_stats["high_entropy_guard/coverage_delta"] = float(
-                high_entropy_coverage - coverage_before
-            )
+            if high_entropy_guard_stats is not None:
+                guard_coverage_after = float(high_entropy_guard_stats["high_entropy_guard/coverage_after"])
+                high_entropy_stats["high_entropy/coverage_after_guard"] = guard_coverage_after
+                high_entropy_stats["high_entropy/coverage_gain_from_correction"] = float(
+                    high_entropy_coverage - guard_coverage_after
+                )
 
     pg_losses1 = -advantages * corrected_ratio
     pg_losses2 = -advantages * torch.clamp(corrected_ratio, final_clip_low, final_clip_high)
@@ -2046,7 +2073,6 @@ def compute_policy_loss_hear(
                 correction_diff = (corrected_ratio - token_importance_ratio).abs()
                 corrected_mask = correction_diff > 1e-6
                 if corrected_mask.any():
-                    # 使用 "count" 后缀，reduce_metrics 会自动求和（而不是平均）
                     storage_dict["ratio/correction_count"] = float(corrected_mask.sum().item())
                     storage_dict["ratio/correction_mean_diff"] = float(
                         correction_diff[corrected_mask].mean().item()
