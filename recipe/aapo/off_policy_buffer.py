@@ -38,7 +38,7 @@ OFF_POLICY_BATCH_KEYS = (
     "token_level_scores",
     "token_level_rewards",
 )
-OFF_POLICY_OPTIONAL_BATCH_KEYS = ("rollout_log_probs", "ref_log_prob", "rm_scores", "dummy_tensor")
+OFF_POLICY_OPTIONAL_BATCH_KEYS = ("rollout_log_probs", "rollout_is_weights", "ref_log_prob", "rm_scores", "dummy_tensor")
 OFF_POLICY_NON_TENSOR_KEYS = ("uid", "multi_modal_inputs")
 
 
@@ -105,7 +105,9 @@ class OffPolicyReplayBuffer:
         if self.pool is None:
             self._lazy_init(selected)
 
-        block_size = min(len(selected), self.capacity)
+        total_selected = len(selected)
+        block_size = min(total_selected, self.capacity)
+        source_start = total_selected - block_size
         insert_indices = (self.position + np.arange(block_size)) % self.capacity
         insert_index_tensor = torch.as_tensor(insert_indices, dtype=torch.long, device=self.pool.device)
 
@@ -115,23 +117,23 @@ class OffPolicyReplayBuffer:
         quality_z = self._compute_quality_z(seq_reward)
 
         for key, value in selected.batch.items():
-            source_value = value[:block_size].detach()
+            source_value = value[source_start : source_start + block_size].detach()
             target_value = source_value.to(self.pool.device)
             self.pool[key].index_copy_(0, insert_index_tensor, target_value)
 
         for key, value in selected.non_tensor_batch.items():
-            self.non_tensor_pool[key][insert_indices] = value[:block_size]
+            self.non_tensor_pool[key][insert_indices] = value[source_start : source_start + block_size]
 
         uid_array = selected.non_tensor_batch.get("uid")
         if uid_array is not None:
-            self.prompt_uids[insert_indices] = uid_array[:block_size]
+            self.prompt_uids[insert_indices] = uid_array[source_start : source_start + block_size]
         else:
             self.prompt_uids[insert_indices] = ""
 
         self.source_steps[insert_indices] = int(global_step)
-        self.seq_rewards[insert_indices] = seq_reward[:block_size].numpy()
-        self.quality_z[insert_indices] = quality_z[:block_size]
-        self.seq_lens[insert_indices] = seq_len[:block_size]
+        self.seq_rewards[insert_indices] = seq_reward[source_start : source_start + block_size].numpy()
+        self.quality_z[insert_indices] = quality_z[source_start : source_start + block_size]
+        self.seq_lens[insert_indices] = seq_len[source_start : source_start + block_size]
 
         self.position = (self.position + block_size) % self.capacity
         self.size = min(self.size + block_size, self.capacity)

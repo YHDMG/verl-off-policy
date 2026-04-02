@@ -2065,8 +2065,11 @@ def compute_policy_loss_hear(
             # 正优势token的ratio统计
             if pos_adv_mask.any():
                 pos_ratios = token_importance_ratio[pos_adv_mask]
+                pos_ratio_std = pos_ratios.new_tensor(0.0)
+                if pos_ratios.numel() > 1:
+                    pos_ratio_std = pos_ratios.std(unbiased=False)
                 storage_dict["ratio/pos_adv_mean"] = float(pos_ratios.mean().item())
-                storage_dict["ratio/pos_adv_std"] = float(pos_ratios.std().item())
+                storage_dict["ratio/pos_adv_std"] = float(pos_ratio_std.item())
                 storage_dict["ratio/pos_adv_max"] = float(pos_ratios.max().item())
                 storage_dict["ratio/pos_adv_min"] = float(pos_ratios.min().item())
                 storage_dict["ratio/pos_adv_exceed_high"] = float(
@@ -2077,8 +2080,11 @@ def compute_policy_loss_hear(
             # 负优势token的ratio统计
             if neg_adv_mask.any():
                 neg_ratios = token_importance_ratio[neg_adv_mask]
+                neg_ratio_std = neg_ratios.new_tensor(0.0)
+                if neg_ratios.numel() > 1:
+                    neg_ratio_std = neg_ratios.std(unbiased=False)
                 storage_dict["ratio/neg_adv_mean"] = float(neg_ratios.mean().item())
-                storage_dict["ratio/neg_adv_std"] = float(neg_ratios.std().item())
+                storage_dict["ratio/neg_adv_std"] = float(neg_ratio_std.item())
                 storage_dict["ratio/neg_adv_max"] = float(neg_ratios.max().item())
                 storage_dict["ratio/neg_adv_min"] = float(neg_ratios.min().item())
                 storage_dict["ratio/neg_adv_below_low"] = float(

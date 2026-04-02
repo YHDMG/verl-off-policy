@@ -392,9 +392,10 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+        """Dump rollout/validation samples as JSONL and plain-text responses."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        response_filename = os.path.join(dump_path, f"{self.global_steps}.responses.txt")
 
         n = len(inputs)
         base_data = {
@@ -417,7 +418,15 @@ class RayPPOTrainer:
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
 
+        response_blocks = []
+        for i, output in enumerate(outputs):
+            response_blocks.append(f"===== sample {i} | step {self.global_steps} =====\n{output}")
+
+        with open(response_filename, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(response_blocks) + "\n")
+
         print(f"Dumped generations to {filename}")
+        print(f"Dumped response texts to {response_filename}")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str

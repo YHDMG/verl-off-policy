@@ -17,6 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
+import math
 from typing import Any, Callable
 
 import numpy as np
@@ -508,6 +509,45 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def compute_pass_at_k(n: int, c: int, k: int) -> float:
+    """
+    Compute pass@k from total samples n, correct samples c, and subset size k.
+    """
+    if n < k:
+        raise ValueError(f"n ({n}) must be >= k ({k})")
+    if c < 0 or c > n:
+        raise ValueError(f"c ({c}) must be between 0 and n ({n})")
+    if k < 1:
+        raise ValueError(f"k ({k}) must be >= 1")
+
+    if c == n:
+        return 1.0
+    if c == 0:
+        return 0.0
+    if n - c < k:
+        return 1.0
+
+    try:
+        prob_all_fail = np.prod(1.0 - k / np.arange(n - c + 1, n + 1, dtype=np.float64))
+        return float(1.0 - prob_all_fail)
+    except (OverflowError, ZeroDivisionError, ValueError):
+        try:
+            log_prob = sum(math.log(1.0 - k / i) for i in range(n - c + 1, n + 1) if i > 0)
+            return float(1.0 - math.exp(log_prob))
+        except (ValueError, OverflowError):
+            return 1.0
+
+
+def compute_pass_at_k_from_scores(scores: list[float | int], k: int) -> float:
+    """
+    Compute pass@k from binary-like scores.
+    Any score > 0.9 is treated as a passing sample to match the async implementation.
+    """
+    n = len(scores)
+    c = sum(1 for score in scores if score > 0.9)
+    return compute_pass_at_k(n=n, c=c, k=k)
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -542,6 +582,7 @@ def process_validation_metrics(
         - "best@N/std": Standard deviation of the best values in bootstrap samples
         - "worst@N/mean": Mean of the worst values in bootstrap samples
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
+        - "pass@N": Pass@k metric for binary-like scores, matching the async implementation
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
 
@@ -600,6 +641,7 @@ def process_validation_metrics(
                 # compute mean and std
                 n_resps = len(var_vals)
                 metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+                metric["pass@1"] = compute_pass_at_k_from_scores(var_vals, k=1)
 
                 if n_resps > 1:
                     metric[f"std@{n_resps}"] = float(np_std(var_vals))
@@ -623,6 +665,7 @@ def process_validation_metrics(
                         metric[f"best@{n}/std"] = bon_std
                         metric[f"worst@{n}/mean"] = won_mean
                         metric[f"worst@{n}/std"] = won_std
+                        metric[f"pass@{n}"] = compute_pass_at_k_from_scores(var_vals, k=n)
 
                         # compute maj metrics
                         if has_pred:

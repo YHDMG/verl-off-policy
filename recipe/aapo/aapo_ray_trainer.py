@@ -234,6 +234,12 @@ class RayAAPOTrainer(RayPPOTrainer):
                 if replay_value.device != current_value.device:
                     replay_value = replay_value.to(current_value.device)
                 aligned_tensors[key] = replay_value
+            elif key == "rollout_is_weights":
+                aligned_tensors[key] = torch.ones(
+                    (replay_size, *current_value.shape[1:]),
+                    dtype=current_value.dtype,
+                    device=current_value.device,
+                )
             else:
                 aligned_tensors[key] = torch.zeros(
                     (replay_size, *current_value.shape[1:]),

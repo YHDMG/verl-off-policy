@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -xeuo pipefail
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2
 export OMP_NUM_THREADS=1
 
 export RAY_NAMESPACE=verl
@@ -29,10 +29,10 @@ export HYDRA_FULL_ERROR=1
 
 # ================================ Project configuration ================================
 project_name='off-policy-hear'
-exp_name='hear-qwen3-1.7b-buffer-test'
+exp_name='hear-ds1.5b-buffer-test'
 
 # ================================ Paths ================================
-model_path='/home/cxy/.cache/modelscope/hub/models/Qwen/Qwen3-1.7B'
+model_path='/home/cxy/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1___5B'
 train_file='/home/cxy/verl_async/dapodataset/train-00000-of-00001_converted_final.parquet'
 test_file='/home/cxy/verl_async/DeepscalerDataset/converted/aime2025_converted_verl_fixed.parquet'
 ckpts_dir="/home/cxy/ckpts/${project_name}/${exp_name}"
@@ -43,15 +43,17 @@ resume_from_path=''
 
 # ================================ GPU / parallel configuration ================================
 nnodes=1
-n_gpus_per_node=8
+n_gpus_per_node=3
 gen_tp=1
 sp_size=1
-fsdp_size=8
+fsdp_size=3
 
 # ================================ Algorithm parameters ================================
 adv_estimator='grpo'
 loss_mode='hear'
-loss_agg_mode='token-mean'
+# Long responses vary a lot in length. Per-sequence averaging is usually more stable
+# than letting the longest samples dominate the actor update.
+loss_agg_mode='seq-mean-token-mean'
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -75,12 +77,13 @@ high_entropy_guard_min_ratio=0.9
 high_entropy_guard_select_ratio=0.2
 high_entropy_guard_max_iters=10
 high_entropy_guard_low_step=0.01
-high_entropy_guard_high_step=0.01
+high_entropy_guard_high_step=0.1
 high_entropy_guard_lower_min=0.7
 high_entropy_guard_upper_max=2.0
 
 entropy_history_size=50
 entropy_ema_beta=0.1
+entropy_coeff=1e-4
 
 # ================================ Off-policy replay parameters ================================
 off_policy_enable=True
@@ -93,13 +96,13 @@ off_policy_replay_anneal_steps=0
 off_policy_warmup_steps=5
 off_policy_quality_alpha=0.5
 off_policy_late_quality_alpha_multiplier=2.0
-off_policy_staleness_horizon=10
+off_policy_staleness_horizon=5
 off_policy_uniform_mix=0.3
 off_policy_late_uniform_mix=0.05
-off_policy_max_age_steps=10
+off_policy_max_age_steps=5
 off_policy_zero_adv_epsilon=1e-6
 off_policy_cpu_offload=True
-off_policy_capacity_steps=10
+off_policy_capacity_steps=5
 
 # ================================ Response length parameters ================================
 max_prompt_length=1024
@@ -120,7 +123,7 @@ actor_offload=False
 rollout_gpu_memory_utilization=0.8
 
 # ================================ Batch parameters ================================
-train_prompt_bsz=16
+train_prompt_bsz=18
 n_resp_per_prompt=8
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
@@ -132,7 +135,7 @@ off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacit
 
 # ================================ Training schedule ================================
 test_freq=10
-save_freq=-1
+save_freq=50
 total_epochs=1
 total_training_steps=500
 val_before_train=False
@@ -140,6 +143,7 @@ val_before_train=False
 # ================================ Misc ================================
 trainer_logger='["console","swanlab"]'
 reward_manager='dapo'
+validation_data_dir="${ckpts_dir}/validation_generations"
 
 rollout_model_len=$((max_prompt_length + max_response_length))
 actor_ppo_max_token_len=$((rollout_model_len * 2))
@@ -212,7 +216,7 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.ppo_epochs="${ppo_epochs}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${ppo_mini_batch_size}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${ppo_micro_batch_size_per_gpu}" \
-    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.entropy_coeff="${entropy_coeff}" \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.fsdp_config.param_offload="${actor_offload}" \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload="${actor_offload}" \
@@ -246,6 +250,7 @@ python3 -m recipe.aapo.main_aapo \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train="${val_before_train}" \
+    trainer.validation_data_dir="${validation_data_dir}" \
     trainer.save_freq="${save_freq}" \
     trainer.test_freq="${test_freq}" \
     trainer.total_epochs="${total_epochs}" \
