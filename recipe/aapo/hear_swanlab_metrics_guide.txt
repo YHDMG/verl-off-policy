@@ -1,0 +1,501 @@
+HEAR / AAPO / SwanLab 指标说明（按当前工程实现整理）
+
+整理范围：
+- HEAR 策略损失与历史 ratio 矫正
+- 高熵 token 复用（dp_actor 最后一轮高熵更新）
+- AAPO replay buffer / off-policy 采样
+- PPO 训练通用指标（actor / critic / timing / perf / rollout correction / variance proxy）
+
+主要来源代码：
+- verl/trainer/ppo/core_algos.py
+- verl/workers/actor/dp_actor.py
+- recipe/aapo/off_policy_buffer.py
+- recipe/aapo/aapo_ray_trainer.py
+- verl/trainer/ppo/metric_utils.py
+- verl/trainer/ppo/rollout_corr_helper.py
+- verl/trainer/ppo/ray_trainer.py
+
+==================================================
+1. 训练流程级指标
+==================================================
+
+training/global_step
+- 当前训练步数。
+
+training/epoch
+- 当前外层 epoch 编号。
+
+==================================================
+2. Actor / PPO 核心指标
+==================================================
+
+actor/pg_loss
+- actor 的策略梯度损失（policy gradient loss）。
+- 是当前 policy loss 函数（vanilla / hear / gspo / dppo 等）的最终标量结果，不含日志前缀变化。
+
+actor/ppo_kl
+- 近似 PPO KL，代码里由 `old_log_prob - log_prob` 的 masked mean 得到。
+- 值越大，表示当前策略相对旧策略偏移越大。
+
+actor/pg_clipfrac
+- PPO 上界 clip 的触发比例。
+- 近似表示有多少有效 token 的策略更新被 clip 上界截断。
+
+actor/pg_clipfrac_lower
+- dual-clip / 下界相关的触发比例。
+- 在不同 loss_mode 下具体语义略有差异，但总体表示“负优势样本或下界截断”触发的程度。
+
+actor/entropy
+- 当前 token 分布熵的聚合值。
+- 越大表示策略更随机，越小表示策略更确定。
+
+actor/kl_loss
+- 若启用参考模型 KL loss，这是 KL 正则项本身的值。
+
+actor/kl_coef
+- KL loss 的系数。
+
+actor/grad_norm
+- actor 参数更新前/时的梯度范数，用于观察训练是否过大或过小。
+
+actor/reward_kl_penalty
+- 奖励阶段使用的 KL penalty 当前值。
+
+actor/reward_kl_penalty_coeff
+- 奖励阶段 KL penalty 的当前系数 beta。
+
+==================================================
+3. HEAR 专属指标
+==================================================
+
+说明：以下指标只在 `loss_mode=hear` 时出现；大多由 `get_hear_metrics()` 从 `core_algos.py` 内部缓存导出。
+
+actor/hear_clip_low
+- HEAR 最终实际使用的 clip 下界。
+- 默认通常接近 `1 - clip_ratio_low`；如果高熵 guard 调宽窗口，这个值可能继续下降。
+
+actor/hear_clip_high
+- HEAR 最终实际使用的 clip 上界。
+- 默认通常接近 `1 + clip_ratio_high`；如果高熵 guard 调宽窗口，这个值可能继续上升。
+
+actor/hear_entropy_mean
+- 当前 batch 的 token entropy 均值（只统计 response_mask 内有效 token）。
+
+actor/hear_entropy_ema_mean
+- entropy 均值的 EMA 平滑结果。
+- 用于观察熵的长期趋势，比单步 entropy_mean 更平滑。
+
+actor/hear_entropy_ema_std
+- entropy 标准差的 EMA 平滑结果。
+- 用于衡量近期 entropy 波动幅度。
+
+actor/hear_high_entropy_coverage
+- HEAR 矫正 + clip 后，高熵 token 中仍落在 clip 窗口内的比例。
+- 可以理解为“高熵 token 被保护得如何”。
+
+--------------------------------------------------
+3.1 HEAR 高熵选择指标（`actor/hear_high_entropy/*`）
+--------------------------------------------------
+
+actor/hear_high_entropy/selected_ratio
+- 被识别为高熵 token 的比例。
+
+actor/hear_high_entropy/threshold
+- 高熵选择阈值；entropy 高于该阈值的 token 会被选中。
+
+actor/hear_high_entropy/entropy_selected_mean
+- 被选中高熵 token 的平均 entropy。
+
+actor/hear_high_entropy/entropy_all_mean
+- 全部有效 token 的平均 entropy。
+
+actor/hear_high_entropy/total_tokens
+- 本批有效 token 总数。
+
+actor/hear_high_entropy/selected_tokens
+- 本批被选中的高熵 token 数量。
+
+actor/hear_high_entropy/coverage_after_guard
+- 仅在高熵 guard 调整 clip 之后，高熵 token 落在 clip 窗口内的比例。
+
+actor/hear_high_entropy/coverage_after_clip
+- 在历史 ratio 矫正和最终 clip 之后，高熵 token 落在 clip 窗口内的比例。
+
+actor/hear_high_entropy/coverage_gain_from_correction
+- 历史 ratio 矫正相对于“仅 guard 后”的覆盖率增益。
+- 正值表示 ratio 矫正进一步帮助高熵 token 留在有效更新区间。
+
+--------------------------------------------------
+3.2 HEAR 高熵 guard 指标（`actor/hear_high_entropy_guard/*`）
+--------------------------------------------------
+
+actor/hear_high_entropy_guard/coverage_before
+- 调整 clip 之前，高熵 token 落在当前 clip 窗口内的比例。
+
+actor/hear_high_entropy_guard/coverage_after
+- guard 调整 clip 之后的覆盖率。
+
+actor/hear_high_entropy_guard/clip_low_before
+- guard 调整前的 clip 下界。
+
+actor/hear_high_entropy_guard/clip_high_before
+- guard 调整前的 clip 上界。
+
+actor/hear_high_entropy_guard/clip_low_after
+- guard 调整后的 clip 下界。
+
+actor/hear_high_entropy_guard/clip_high_after
+- guard 调整后的 clip 上界。
+
+actor/hear_high_entropy_guard/clip_range_before
+- guard 调整前 clip 窗口宽度（上界 - 下界）。
+
+actor/hear_high_entropy_guard/clip_range_after
+- guard 调整后 clip 窗口宽度。
+
+actor/hear_high_entropy_guard/iterations_used
+- guard 迭代调整窗口时实际用了多少次迭代。
+
+actor/hear_high_entropy_guard/target_ratio
+- 目标覆盖率，即希望至少多少比例的高熵 token 留在 clip 窗口内。
+
+actor/hear_high_entropy_guard/clip_low_delta
+- clip 下界相对初始值的变化量。
+
+actor/hear_high_entropy_guard/clip_high_delta
+- clip 上界相对初始值的变化量。
+
+actor/hear_high_entropy_guard/coverage_delta
+- guard 带来的覆盖率增量。
+
+--------------------------------------------------
+3.3 HEAR ratio 统计（`actor/hear_ratio/*`）
+--------------------------------------------------
+
+actor/hear_ratio/pos_adv_mean
+- 正优势 token 的原始 importance ratio 平均值。
+
+actor/hear_ratio/pos_adv_std
+- 正优势 token 的原始 importance ratio 标准差。
+
+actor/hear_ratio/pos_adv_max
+- 正优势 token 的原始 importance ratio 最大值。
+
+actor/hear_ratio/pos_adv_min
+- 正优势 token 的原始 importance ratio 最小值。
+
+actor/hear_ratio/pos_adv_exceed_high
+- 正优势 token 中，超过最终 clip 上界的比例。
+
+actor/hear_ratio/pos_adv_count
+- 正优势有效 token 数量。
+
+actor/hear_ratio/neg_adv_mean
+- 负优势 token 的原始 importance ratio 平均值。
+
+actor/hear_ratio/neg_adv_std
+- 负优势 token 的原始 importance ratio 标准差。
+
+actor/hear_ratio/neg_adv_max
+- 负优势 token 的原始 importance ratio 最大值。
+
+actor/hear_ratio/neg_adv_min
+- 负优势 token 的原始 importance ratio 最小值。
+
+actor/hear_ratio/neg_adv_below_low
+- 负优势 token 中，低于最终 clip 下界的比例。
+
+actor/hear_ratio/neg_adv_count
+- 负优势有效 token 数量。
+
+actor/hear_ratio/correction_count
+- 本次被历史 ratio 矫正实际修改的 token 数量。
+
+actor/hear_ratio/correction_mean_diff
+- 被修改 token 上，矫正前后 ratio 的平均绝对差。
+- 越大表示历史 ratio correction 介入得越强。
+
+==================================================
+4. 高熵 token 复用 / 最后一轮高熵更新指标（dp_actor）
+==================================================
+
+说明：这组指标对应 `dp_actor.py` 中“偶数个 PPO epoch 的最后一轮，只用高熵 token 更新”的逻辑。
+命名通常是 `actor/high_entropy/*`，与 HEAR 内部的 `actor/hear_high_entropy/*` 不是一回事。
+
+actor/high_entropy/selected_ratio
+- 在最后一轮高熵更新中，被选中的高熵 token 占有效 token 的比例。
+
+actor/high_entropy/threshold
+- 用于挑选高熵 token 的 entropy 阈值。
+
+actor/high_entropy/entropy_selected_mean
+- 被选中的高熵 token 的平均 entropy。
+
+actor/high_entropy/entropy_all_mean
+- 候选有效 token 的平均 entropy。
+
+actor/high_entropy/total_tokens
+- 参与高熵筛选的有效 token 总数。
+
+actor/high_entropy/selected_tokens
+- 实际被选中用于最后一轮更新的 token 数量。
+
+actor/high_entropy/positive_reward_sequences
+- 本 micro-batch 中 reward 为正的轨迹数量。
+- 因为当前实现优先在正奖励轨迹内做高熵筛选。
+
+actor/high_entropy/positive_reward_sequence_ratio
+- 正奖励轨迹占比。
+
+actor/high_entropy/empty_selection_micro_batch_count
+- 某个 micro-batch 在高熵筛选后一个 token 都没有被选中时记 1。
+- 值大说明最后一轮“高熵专用更新”经常没有真正发生。
+
+==================================================
+5. Off-policy replay / AAPO 指标
+==================================================
+
+actor/on_policy_tokens
+- 当前 step 的 on-policy 有效 token 数。
+
+actor/replay_tokens
+- 本 step 混入 replay batch 后，来自 replay 的有效 token 数。
+
+off_policy/replay_fraction
+- replay 样本在 actor 训练 batch 中占的序列比例。
+
+off_policy/schedule_progress
+- replay 调度进度，通常在 0 到 1 之间。
+
+off_policy/effective_replay_batch_size
+- 当前 step 实际想采样的 replay batch size（经过 schedule 和对齐规则后）。
+
+off_policy/effective_replay_ratio
+- 当前有效 replay batch size / 基础 replay batch size。
+
+off_policy/effective_quality_alpha
+- 当前 replay 优先级里 quality 项的系数。
+
+off_policy/effective_uniform_mix
+- 当前 replay 采样里均匀采样混合比例。
+
+off_policy/buffer_size
+- 当前 replay buffer 里已有的样本条数。
+
+off_policy/replay_batch_size
+- 当前 step 实际从 replay buffer 采出的 batch size。
+
+off_policy/sample_age_mean
+- replay 样本平均年龄（当前 global_step - source_step）。
+
+off_policy/sample_age_max
+- replay 样本最大年龄。
+
+off_policy/seq_reward_mean
+- 被采样 replay 样本的平均序列奖励。
+
+off_policy/priority_entropy
+- replay 采样概率分布的熵。
+- 越低说明采样更集中，越高说明更接近均匀。
+
+off_policy/replay_hit_rate
+- 想采 replay 时是否成功拿到足够 replay 样本。
+- 1.0 表示成功；小于 1 说明有效 replay 样本不足。
+
+off_policy/sample_probability_mean
+- 本次被采样 replay 样本的平均采样概率。
+
+off_policy/skipped_zero_adv_groups
+- 入池时，因为整个组 advantage 近似全 0 而被跳过的 group 数量。
+
+off_policy/skipped_zero_adv_sequences
+- 因 zero-adv group 规则被跳过的序列数量。
+
+off_policy/accepted_sequences
+- 本次写入 replay buffer 时实际接收的序列数量。
+
+off_policy/accepted_ratio
+- 实际接收序列数 / 原候选序列数。
+
+off_policy_seqlen/*
+- 若开启 batch balance，这组指标描述 replay 混入后按序列长度重平衡的状态。
+
+==================================================
+6. Critic / 数据统计指标
+==================================================
+
+critic/score/mean|max|min
+- 序列级 score（`token_level_scores` 求和）的均值/最大值/最小值。
+
+critic/rewards/mean|max|min
+- 序列级 reward（`token_level_rewards` 求和）的均值/最大值/最小值。
+
+critic/advantages/mean|max|min
+- 有效 response token 上 advantage 的均值/最大值/最小值。
+
+critic/returns/mean|max|min
+- 有效 response token 上 return 的均值/最大值/最小值。
+
+critic/values/mean|max|min
+- 有效 response token 上 value 预测的均值/最大值/最小值。
+
+critic/vf_explained_var
+- value function explained variance。
+- 越接近 1 通常表示 value 对 return 的解释越好；很低或负值说明 critic 拟合较差。
+
+==================================================
+7. 长度与数据形态指标
+==================================================
+
+response_length/mean|max|min
+- response 实际有效长度统计。
+
+response_length/clip_ratio
+- response 长度正好打满最大 response 长度的比例。
+- 值高常表示很多样本被长度上限截断。
+
+response_length_non_aborted/mean|max|min
+- 只统计非 aborted 样本（response 长度 > 0）的 response 长度。
+
+response_length_non_aborted/clip_ratio
+- 非 aborted 样本中打满最大长度的比例。
+
+response/aborted_ratio
+- response 长度为 0 的样本比例。
+
+prompt_length/mean|max|min
+- prompt 有效长度统计。
+
+prompt_length/clip_ratio
+- prompt 长度正好打满最大 prompt 长度的比例。
+
+num_turns/mean|max|min
+- 多轮对话样本的轮数统计（如果 batch 中带 `__num_turns__`）。
+
+tool_call_counts/mean|max|min
+- 工具调用次数统计（如果 batch 中带 `tool_call_counts`）。
+
+==================================================
+8. Rollout correction / Off-policy gap 指标
+==================================================
+
+说明：这组指标通常带 `rollout_corr/` 前缀，用来描述当前训练策略与 rollout 策略之间的偏移。
+具体指标会随配置（IS / rejection sampling / token-level / sequence-level）不同而变化。
+
+常见理解方法：
+- `rollout_corr/...mean`：该统计量的平均值。
+- `rollout_corr/...std`：波动程度。
+- `rollout_corr/...max|min`：极值。
+- `rollout_corr/...above_threshold` / `...below_threshold`：超阈值比例。
+- `rollout_corr/...masked_fraction`：因为 rejection 或过滤被屏蔽的比例。
+- `rollout_corr/...ess`：有效样本数 proxy（effective sample size），越低说明 off-policy 偏差越严重。
+
+rollout_corr/empty_mask_count
+- response_mask 为空时的计数。
+
+如果你在面板里看到大量这类键，可以按三类来读：
+1) 策略偏移程度：KL / PPL / chi-square / log-ratio 类
+2) IS 权重稳定性：weight mean/std/max/min、ESS、超阈值比例
+3) rejection 过滤强度：masked_fraction、seq_masked_fraction
+
+==================================================
+9. Timing / 性能指标
+==================================================
+
+timing_s/*
+- 各阶段的原始耗时（秒）。
+- 常见阶段：`gen`、`ref`、`values`、`adv`、`update_actor`、`update_critic`、`step` 等。
+
+timing_per_token_ms/*
+- 各阶段的单位 token 耗时（毫秒）。
+- 便于在 batch size 不同的情况下比较效率。
+
+perf/total_num_tokens
+- 当前 step 总 token 数。
+
+perf/time_per_step
+- 当前 step 总耗时（秒）。
+
+perf/throughput
+- 吞吐：每秒每 GPU 处理的 token 数。
+
+perf/mfu/actor
+- actor 训练阶段的 MFU（若底层 worker 上报）。
+
+perf/mfu/critic
+- critic 训练阶段的 MFU（若底层 worker 上报）。
+
+perf/mfu/actor_infer
+- 重新计算 old_log_probs / entropy 等推理阶段的 MFU。
+
+==================================================
+10. Variance proxy 指标
+==================================================
+
+variance_proxy/proxy1_signal_strength
+- 近似信号强度，通常用梯度范数平方表示。
+
+variance_proxy/proxy2_total_power
+- 总功率 proxy，近似 `E[||g_hat||^2]`。
+
+variance_proxy/proxy3_pure_noise
+- 纯噪声 proxy，近似“总功率 - 信号强度”后的噪声部分。
+
+variance_proxy/expected_a_squared
+- advantage 平方的期望。
+
+variance_proxy/expected_w
+- W-score / score-norm proxy 的期望。
+
+==================================================
+11. 如何快速读 SwanLab 面板
+==================================================
+
+如果你主要关心 HEAR 是否工作，可以优先看：
+- actor/ppo_kl
+- actor/pg_clipfrac
+- actor/hear_clip_low
+- actor/hear_clip_high
+- actor/hear_ratio/correction_count
+- actor/hear_ratio/correction_mean_diff
+- actor/hear_high_entropy_coverage
+- actor/hear_high_entropy_guard/coverage_before
+- actor/hear_high_entropy_guard/coverage_after
+
+如果你主要关心高熵 token 复用是否真的发生，可以优先看：
+- actor/high_entropy/selected_ratio
+- actor/high_entropy/selected_tokens
+- actor/high_entropy/positive_reward_sequence_ratio
+- actor/high_entropy/empty_selection_micro_batch_count
+
+如果你主要关心 replay buffer 是否真正参与训练，可以优先看：
+- actor/on_policy_tokens
+- actor/replay_tokens
+- off_policy/replay_fraction
+- off_policy/buffer_size
+- off_policy/replay_hit_rate
+- off_policy/sample_age_mean
+- off_policy/sample_probability_mean
+
+如果你主要关心训练是否稳定，可以优先看：
+- actor/pg_loss
+- actor/grad_norm
+- actor/entropy
+- critic/vf_explained_var
+- rollout_corr/*
+- variance_proxy/*
+
+==================================================
+12. 备注
+==================================================
+
+1) 同名指标在不同并行/聚合路径下，可能经过 mean / sum / min / max 聚合。
+2) 以 `/count`、`_count`、`/total_tokens`、`/selected_tokens`、`/positive_reward_sequences` 结尾的指标，在 reduce 时倾向于做求和。
+3) 不是所有指标在所有策略后端都会出现；是否出现取决于：
+- loss_mode
+- 是否启用 hear
+- 是否启用 high_entropy_ratio
+- 是否启用 replay/off_policy
+- 是否启用 rollout correction
+- 当前 actor 后端是 dp 还是 megatron
+

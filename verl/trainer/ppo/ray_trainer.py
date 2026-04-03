@@ -1423,11 +1423,13 @@ class RayPPOTrainer:
                                 loss_agg_mode=actor_config.loss_agg_mode,
                                 loss_scale_factor=actor_config.loss_scale_factor,
                             )
+                            seq_mean_entropy = masked_mean(entropys, mask=response_masks, axis=-1).detach().float()
                             old_log_prob_metrics = {
                                 "actor/entropy": entropy_agg.detach().item(),
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch["seq_mean_entropy"] = seq_mean_entropy
                             old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(

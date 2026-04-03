@@ -78,6 +78,22 @@ actor_rollout_ref:
       clip_cov_ub: 5.0
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
+      entropy_history_size: 50
+      entropy_ema_beta: 0.1
+      enable_correction: true
+      correction_history_size: 10
+      correction_trigger_high: 20.0
+      correction_beta: 1.0
+      correction_lambda: 1.0
+      enable_high_entropy_guard: false
+      high_entropy_guard_min_ratio: 0.2
+      high_entropy_guard_quantile: 0.8
+      high_entropy_guard_select_ratio: null
+      high_entropy_guard_max_iters: 5
+      high_entropy_guard_low_step: 0.01
+      high_entropy_guard_high_step: 0.01
+      high_entropy_guard_lower_min: null
+      high_entropy_guard_upper_max: null
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null

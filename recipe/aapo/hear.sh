@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -xeuo pipefail
-export CUDA_VISIBLE_DEVICES=0,1,2
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export OMP_NUM_THREADS=1
 
 export RAY_NAMESPACE=verl
@@ -35,7 +35,7 @@ exp_name='hear-ds1.5b-buffer-test'
 model_path='/home/cxy/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1___5B'
 train_file='/home/cxy/verl_async/dapodataset/train-00000-of-00001_converted_final.parquet'
 test_file='/home/cxy/verl_async/DeepscalerDataset/converted/aime2025_converted_verl_fixed.parquet'
-ckpts_dir="/home/cxy/ckpts/${project_name}/${exp_name}"
+ckpts_dir="/mnt/data1/ckpts/${project_name}/${exp_name}"
 
 # ================================ Resume configuration ================================
 resume_mode='disable'
@@ -43,17 +43,15 @@ resume_from_path=''
 
 # ================================ GPU / parallel configuration ================================
 nnodes=1
-n_gpus_per_node=3
+n_gpus_per_node=4
 gen_tp=1
 sp_size=1
-fsdp_size=3
+fsdp_size=4
 
 # ================================ Algorithm parameters ================================
 adv_estimator='grpo'
 loss_mode='hear'
-# Long responses vary a lot in length. Per-sequence averaging is usually more stable
-# than letting the longest samples dominate the actor update.
-loss_agg_mode='seq-mean-token-mean'
+loss_agg_mode='token-mean'
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -65,19 +63,19 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # ================================ HEAR parameters ================================
-# The dp-actor reuse path is enabled on the last PPO epoch, so keep ppo_epochs even.
 high_entropy_ratio=0.2
 enable_correction=True
 correction_history_size=10
-correction_trigger_high=20.0
+correction_beta=1.5
+correction_lambda=1.0
 
 enable_high_entropy_guard=True
 # Guard coverage is measured on the selected HEAR token subset, not on all response tokens.
 high_entropy_guard_min_ratio=0.9
-high_entropy_guard_select_ratio=0.2
-high_entropy_guard_max_iters=10
+high_entropy_guard_select_ratio=0.4
+high_entropy_guard_max_iters=25
 high_entropy_guard_low_step=0.01
-high_entropy_guard_high_step=0.1
+high_entropy_guard_high_step=0.05
 high_entropy_guard_lower_min=0.7
 high_entropy_guard_upper_max=2.0
 
@@ -87,22 +85,29 @@ entropy_coeff=1e-4
 
 # ================================ Off-policy replay parameters ================================
 off_policy_enable=True
-off_policy_quality_metric='seq_reward'
+off_policy_quality_metric='seq_mean_entropy'
 off_policy_replay_mini_batch_multiplier=1
 off_policy_replay_schedule_type='cosine_decay'
 off_policy_replay_start_ratio=1.0
 off_policy_replay_end_ratio=0.25
 off_policy_replay_anneal_steps=0
-off_policy_warmup_steps=5
+off_policy_warmup_steps=4
 off_policy_quality_alpha=0.5
 off_policy_late_quality_alpha_multiplier=2.0
-off_policy_staleness_horizon=5
+off_policy_staleness_horizon=4
 off_policy_uniform_mix=0.3
 off_policy_late_uniform_mix=0.05
-off_policy_max_age_steps=5
+off_policy_max_age_steps=4
 off_policy_zero_adv_epsilon=1e-6
 off_policy_cpu_offload=True
-off_policy_capacity_steps=5
+off_policy_capacity_steps=4
+off_policy_enable_difficulty_sampling=True
+off_policy_difficulty_metric='pass_rate'
+off_policy_difficulty_pass_threshold=0.9
+off_policy_difficulty_alpha=1.0
+off_policy_difficulty_min_priority_scale=0.5
+off_policy_difficulty_medium_lower=0.25
+off_policy_difficulty_medium_upper=0.75
 
 # ================================ Response length parameters ================================
 max_prompt_length=1024
@@ -123,13 +128,13 @@ actor_offload=False
 rollout_gpu_memory_utilization=0.8
 
 # ================================ Batch parameters ================================
-train_prompt_bsz=18
+train_prompt_bsz=64
 n_resp_per_prompt=8
-ppo_mini_batch_size=8
-ppo_micro_batch_size_per_gpu=1
+ppo_mini_batch_size=16
+ppo_micro_batch_size_per_gpu=4
 ppo_epochs=2
-rollout_log_prob_micro_batch_size_per_gpu=1
-ref_log_prob_micro_batch_size_per_gpu=1
+rollout_log_prob_micro_batch_size_per_gpu=4
+ref_log_prob_micro_batch_size_per_gpu=4
 
 off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps))
 
@@ -182,6 +187,13 @@ python3 -m recipe.aapo.main_aapo \
     algorithm.off_policy.max_age_steps="${off_policy_max_age_steps}" \
     algorithm.off_policy.zero_adv_epsilon="${off_policy_zero_adv_epsilon}" \
     algorithm.off_policy.cpu_offload="${off_policy_cpu_offload}" \
+    algorithm.off_policy.enable_difficulty_sampling="${off_policy_enable_difficulty_sampling}" \
+    algorithm.off_policy.difficulty_metric="${off_policy_difficulty_metric}" \
+    algorithm.off_policy.difficulty_pass_threshold="${off_policy_difficulty_pass_threshold}" \
+    algorithm.off_policy.difficulty_alpha="${off_policy_difficulty_alpha}" \
+    algorithm.off_policy.difficulty_min_priority_scale="${off_policy_difficulty_min_priority_scale}" \
+    algorithm.off_policy.difficulty_medium_lower="${off_policy_difficulty_medium_lower}" \
+    algorithm.off_policy.difficulty_medium_upper="${off_policy_difficulty_medium_upper}" \
     actor_rollout_ref.actor.use_kl_loss="${use_kl_loss}" \
     actor_rollout_ref.actor.kl_loss_coef="${kl_loss_coef}" \
     actor_rollout_ref.actor.kl_loss_type="${kl_loss_type}" \
@@ -190,10 +202,11 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.high_entropy_ratio="${high_entropy_ratio}" \
     actor_rollout_ref.actor.policy_loss.enable_correction="${enable_correction}" \
     actor_rollout_ref.actor.policy_loss.correction_history_size="${correction_history_size}" \
-    actor_rollout_ref.actor.policy_loss.correction_trigger_high="${correction_trigger_high}" \
+    actor_rollout_ref.actor.policy_loss.correction_beta="${correction_beta}" \
+    actor_rollout_ref.actor.policy_loss.correction_lambda="${correction_lambda}" \
     actor_rollout_ref.actor.policy_loss.enable_high_entropy_guard="${enable_high_entropy_guard}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_min_ratio="${high_entropy_guard_min_ratio}" \
-    actor_rollout_ref.actor.policy_loss.high_entropy_guard_select_ratio="${high_entropy_guard_select_ratio}" \
+        actor_rollout_ref.actor.policy_loss.high_entropy_guard_select_ratio="${high_entropy_guard_select_ratio}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_max_iters="${high_entropy_guard_max_iters}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_low_step="${high_entropy_guard_low_step}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_high_step="${high_entropy_guard_high_step}" \

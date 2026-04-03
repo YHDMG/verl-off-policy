@@ -582,7 +582,7 @@ class OffPolicyConfig(BaseConfig):
     replay_start_ratio: float = 1.0
     replay_end_ratio: float = 0.25
     replay_anneal_steps: int = 0
-    quality_metric: str = "seq_reward"
+    quality_metric: str = "seq_mean_entropy"
     quality_alpha: float = 1.0
     late_quality_alpha_multiplier: float = 2.0
     staleness_horizon: int = 200
@@ -591,6 +591,21 @@ class OffPolicyConfig(BaseConfig):
     max_age_steps: int = 500
     zero_adv_epsilon: float = 1e-6
     cpu_offload: bool = True
+    replay_bias_beta_start: float = 0.4
+    replay_bias_beta_end: float = 1.0
+    replay_bias_weight_clip: float = 5.0
+    replay_health_ema_beta: float = 0.2
+    replay_health_target_ess: float = 0.6
+    replay_health_target_seq_dev: float = 0.15
+    replay_health_uniform_mix_boost: float = 0.3
+    replay_health_alpha_min_scale: float = 0.25
+    enable_difficulty_sampling: bool = False
+    difficulty_metric: str = "pass_rate"
+    difficulty_pass_threshold: float = 0.9
+    difficulty_alpha: float = 1.0
+    difficulty_min_priority_scale: float = 0.5
+    difficulty_medium_lower: float = 0.25
+    difficulty_medium_upper: float = 0.75
 
 
 @dataclass

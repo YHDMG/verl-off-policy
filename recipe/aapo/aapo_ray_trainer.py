@@ -45,6 +45,8 @@ class OffPolicyScheduleState:
     effective_replay_ratio: float
     effective_quality_alpha: float
     effective_uniform_mix: float
+    replay_bias_beta: float
+    health_factor: float
     schedule_progress: float
 
 
@@ -55,6 +57,10 @@ class RayAAPOTrainer(RayPPOTrainer):
         super().__init__(*args, **kwargs)
         self.off_policy_config: OffPolicyConfig | None = None
         self.off_policy_buffer: OffPolicyReplayBuffer | None = None
+        self._replay_health_state = {
+            "ess_ema": 1.0,
+            "seq_dev_ema": 0.0,
+        }
         self._init_off_policy_replay()
 
     def _init_off_policy_replay(self) -> None:
@@ -91,6 +97,8 @@ class RayAAPOTrainer(RayPPOTrainer):
                 "off_policy/effective_replay_ratio": schedule_state.effective_replay_ratio,
                 "off_policy/effective_quality_alpha": schedule_state.effective_quality_alpha,
                 "off_policy/effective_uniform_mix": schedule_state.effective_uniform_mix,
+                "off_policy/replay_bias_beta": schedule_state.replay_bias_beta,
+                "off_policy/health_factor": schedule_state.health_factor,
             }
         )
         metrics.update(self.off_policy_buffer.empty_metrics(schedule_state.effective_replay_batch_size))
@@ -110,11 +118,16 @@ class RayAAPOTrainer(RayPPOTrainer):
             current_step=self.global_steps,
             quality_alpha=schedule_state.effective_quality_alpha,
             uniform_mix=schedule_state.effective_uniform_mix,
+            bias_beta=schedule_state.replay_bias_beta,
+            bias_weight_clip=float(self.off_policy_config.replay_bias_weight_clip),
         )
         metrics.update(sample_output.metrics)
         replay_batch = sample_output.batch
         if replay_batch is None:
             return batch, metrics
+
+        self._update_replay_health_state(sample_output.metrics)
+        batch = self._attach_on_policy_replay_sampling_weight(batch)
 
         replay_batch = self._align_replay_batch_to_current(batch, replay_batch)
         replay_batch.meta_info = deepcopy(batch.meta_info)
@@ -133,7 +146,17 @@ class RayAAPOTrainer(RayPPOTrainer):
     def _record_off_policy_batch(self, batch: DataProto) -> dict[str, float]:
         if self.off_policy_buffer is None:
             return {}
-        return self.off_policy_buffer.add_batch(batch, global_step=self.global_steps)
+        add_metrics = self.off_policy_buffer.add_batch(batch, global_step=self.global_steps)
+        add_metric_map = {
+            "off_policy/skipped_zero_adv_groups": "off_policy/add_skipped_zero_adv_groups",
+            "off_policy/skipped_zero_adv_sequences": "off_policy/add_skipped_zero_adv_sequences",
+            "off_policy/accepted_sequences": "off_policy/add_accepted_sequences",
+            "off_policy/accepted_ratio": "off_policy/add_accepted_ratio",
+        }
+        remapped_metrics = {}
+        for key, value in add_metrics.items():
+            remapped_metrics[add_metric_map.get(key, key)] = value
+        return remapped_metrics
 
     def _get_actor_dp_size(self) -> int:
         if getattr(self, "actor_rollout_wg", None) is not None:
@@ -159,6 +182,8 @@ class RayAAPOTrainer(RayPPOTrainer):
                 effective_replay_ratio=0.0,
                 effective_quality_alpha=float(self.off_policy_config.quality_alpha),
                 effective_uniform_mix=float(self.off_policy_config.uniform_mix),
+                replay_bias_beta=float(self.off_policy_config.replay_bias_beta_start),
+                health_factor=1.0,
                 schedule_progress=0.0,
             )
 
@@ -179,8 +204,21 @@ class RayAAPOTrainer(RayPPOTrainer):
         scheduled_replay_ratio = replay_end_ratio + (replay_start_ratio - replay_end_ratio) * 0.5 * (
             1.0 + math.cos(math.pi * progress)
         )
+        base_scheduled_replay_batch_size = math.floor(base_replay_batch_size * scheduled_replay_ratio)
+        base_scheduled_quality_alpha = float(self.off_policy_config.quality_alpha) * (
+            1.0 + (float(self.off_policy_config.late_quality_alpha_multiplier) - 1.0) * progress
+        )
+        base_scheduled_uniform_mix = float(self.off_policy_config.uniform_mix) + (
+            float(self.off_policy_config.late_uniform_mix) - float(self.off_policy_config.uniform_mix)
+        ) * progress
+        base_scheduled_uniform_mix = float(np.clip(base_scheduled_uniform_mix, 0.0, 1.0))
+        replay_bias_beta = float(
+            self.off_policy_config.replay_bias_beta_start
+            + (self.off_policy_config.replay_bias_beta_end - self.off_policy_config.replay_bias_beta_start) * progress
+        )
+        health_factor = self._compute_replay_health_factor()
 
-        raw_effective_replay_batch_size = math.floor(base_replay_batch_size * scheduled_replay_ratio)
+        raw_effective_replay_batch_size = math.floor(base_scheduled_replay_batch_size * health_factor)
         rollout_n = max(int(self.config.actor_rollout_ref.rollout.n), 1)
         is_grpo = self._normalize_adv_estimator(self.config.algorithm.adv_estimator) == AdvantageEstimator.GRPO
         if self.config.actor_rollout_ref.actor.use_dynamic_bsz:
@@ -205,14 +243,18 @@ class RayAAPOTrainer(RayPPOTrainer):
         else:
             effective_replay_batch_size = raw_effective_replay_batch_size
         effective_replay_batch_size = min(base_replay_batch_size, effective_replay_batch_size)
-
-        effective_quality_alpha = float(self.off_policy_config.quality_alpha) * (
-            1.0 + (float(self.off_policy_config.late_quality_alpha_multiplier) - 1.0) * progress
+        effective_quality_alpha = base_scheduled_quality_alpha * max(
+            float(health_factor),
+            float(self.off_policy_config.replay_health_alpha_min_scale),
         )
-        effective_uniform_mix = float(self.off_policy_config.uniform_mix) + (
-            float(self.off_policy_config.late_uniform_mix) - float(self.off_policy_config.uniform_mix)
-        ) * progress
-        effective_uniform_mix = float(np.clip(effective_uniform_mix, 0.0, 1.0))
+        effective_uniform_mix = float(
+            np.clip(
+                base_scheduled_uniform_mix
+                + (1.0 - float(health_factor)) * float(self.off_policy_config.replay_health_uniform_mix_boost),
+                0.0,
+                1.0,
+            )
+        )
         effective_replay_ratio = effective_replay_batch_size / float(base_replay_batch_size)
 
         return OffPolicyScheduleState(
@@ -221,8 +263,45 @@ class RayAAPOTrainer(RayPPOTrainer):
             effective_replay_ratio=effective_replay_ratio,
             effective_quality_alpha=effective_quality_alpha,
             effective_uniform_mix=effective_uniform_mix,
+            replay_bias_beta=replay_bias_beta,
+            health_factor=health_factor,
             schedule_progress=progress,
         )
+
+    def _compute_replay_health_factor(self) -> float:
+        assert self.off_policy_config is not None
+
+        ess_target = max(float(self.off_policy_config.replay_health_target_ess), 1e-8)
+        seq_dev_target = max(float(self.off_policy_config.replay_health_target_seq_dev), 1e-8)
+        ess_ema = float(self._replay_health_state["ess_ema"])
+        seq_dev_ema = float(self._replay_health_state["seq_dev_ema"])
+
+        ess_factor = float(np.clip(ess_ema / ess_target, 0.0, 1.0))
+        dev_factor = float(np.clip(seq_dev_target / max(seq_dev_ema, 1e-8), 0.0, 1.0))
+        return min(ess_factor, dev_factor)
+
+    def _update_replay_health_state(self, sample_metrics: dict[str, float]) -> None:
+        assert self.off_policy_config is not None
+
+        ema_beta = float(np.clip(self.off_policy_config.replay_health_ema_beta, 0.0, 1.0))
+        sample_ess = float(sample_metrics.get("off_policy/sample_rollout_is_eff_sample_size", 1.0))
+        sample_seq_dev = float(sample_metrics.get("off_policy/sample_rollout_is_seq_abs_mean_deviation", 0.0))
+
+        self._replay_health_state["ess_ema"] = (
+            (1.0 - ema_beta) * float(self._replay_health_state["ess_ema"]) + ema_beta * sample_ess
+        )
+        self._replay_health_state["seq_dev_ema"] = (
+            (1.0 - ema_beta) * float(self._replay_health_state["seq_dev_ema"]) + ema_beta * sample_seq_dev
+        )
+
+    @staticmethod
+    def _attach_on_policy_replay_sampling_weight(batch: DataProto) -> DataProto:
+        if "replay_sampling_weight" in batch.batch.keys():
+            return batch
+
+        response_mask = batch.batch["response_mask"]
+        replay_sampling_weight = torch.ones(len(batch), dtype=torch.float32, device=response_mask.device)
+        return batch.union(DataProto.from_dict(tensors={"replay_sampling_weight": replay_sampling_weight}))
 
     def _align_replay_batch_to_current(self, batch: DataProto, replay_batch: DataProto) -> DataProto:
         replay_size = len(replay_batch)
@@ -234,7 +313,7 @@ class RayAAPOTrainer(RayPPOTrainer):
                 if replay_value.device != current_value.device:
                     replay_value = replay_value.to(current_value.device)
                 aligned_tensors[key] = replay_value
-            elif key == "rollout_is_weights":
+            elif key in {"rollout_is_weights", "replay_sampling_weight"}:
                 aligned_tensors[key] = torch.ones(
                     (replay_size, *current_value.shape[1:]),
                     dtype=current_value.dtype,

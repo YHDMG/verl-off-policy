@@ -83,6 +83,8 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         enable_high_entropy_guard (bool): Protect a subset of high-entropy tokens from over-clipping.
         enable_correction (bool): Enable history-based ratio correction in HEAR.
+        correction_beta (float): Scale coefficient for the historical log-ratio anchor.
+        correction_lambda (float): Regularization strength when pulling log-ratio back to the anchor.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
@@ -97,6 +99,8 @@ class PolicyLossConfig(BaseConfig):
     enable_correction: bool = True
     correction_history_size: int = 10
     correction_trigger_high: float = 20.0
+    correction_beta: float = 1.0
+    correction_lambda: float = 1.0
     enable_high_entropy_guard: bool = False
     high_entropy_guard_min_ratio: float = 0.2
     high_entropy_guard_quantile: float = 0.8

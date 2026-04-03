@@ -23,6 +23,7 @@ from tensordict import TensorDict
 
 from verl import DataProto
 from verl.trainer.config.algorithm import OffPolicyConfig
+import verl.utils.torch_functional as verl_F
 
 OFF_POLICY_BATCH_KEYS = (
     "input_ids",
@@ -38,12 +39,20 @@ OFF_POLICY_BATCH_KEYS = (
     "token_level_scores",
     "token_level_rewards",
 )
-OFF_POLICY_OPTIONAL_BATCH_KEYS = ("rollout_log_probs", "rollout_is_weights", "ref_log_prob", "rm_scores", "dummy_tensor")
+OFF_POLICY_OPTIONAL_BATCH_KEYS = (
+    "rollout_log_probs",
+    "rollout_is_weights",
+    "ref_log_prob",
+    "rm_scores",
+    "dummy_tensor",
+    "seq_mean_entropy",
+)
 OFF_POLICY_NON_TENSOR_KEYS = ("uid", "multi_modal_inputs")
 
 
 def compute_off_policy_warmup_size(config: OffPolicyConfig, train_batch_size: int, rollout_n: int) -> int:
-    return max(int(config.warmup_steps), 0) * int(train_batch_size) * int(rollout_n)
+    raw_warmup_size = max(int(config.warmup_steps), 0) * int(train_batch_size) * int(rollout_n)
+    return min(raw_warmup_size, int(config.capacity))
 
 
 def compute_replay_batch_size(config: OffPolicyConfig, actor_mini_batch_size: int, rollout_n: int) -> int:
@@ -70,10 +79,17 @@ class OffPolicyReplayBuffer:
         self.capacity = int(config.capacity)
         if self.capacity <= 0:
             raise ValueError(f"OffPolicyReplayBuffer capacity must be positive, got {self.capacity}")
-        if config.quality_metric != "seq_reward":
+        supported_quality_metrics = {"seq_reward", "seq_mean_entropy"}
+        if config.quality_metric not in supported_quality_metrics:
             raise ValueError(
-                "OffPolicyReplayBuffer v1 only supports quality_metric='seq_reward'. "
-                f"Got {config.quality_metric}."
+                "OffPolicyReplayBuffer v1 only supports quality_metric in "
+                f"{supported_quality_metrics}. Got {config.quality_metric}."
+            )
+        supported_difficulty_metrics = {"group_relative_dispersion", "pass_rate"}
+        if config.difficulty_metric not in supported_difficulty_metrics:
+            raise ValueError(
+                "OffPolicyReplayBuffer difficulty sampling only supports "
+                f"{supported_difficulty_metrics}. Got {config.difficulty_metric}."
             )
 
         self.pool: Optional[TensorDict] = None
@@ -84,9 +100,13 @@ class OffPolicyReplayBuffer:
 
         self.source_steps = np.full(self.capacity, -1, dtype=np.int64)
         self.seq_rewards = np.zeros(self.capacity, dtype=np.float32)
+        self.seq_mean_entropy = np.zeros(self.capacity, dtype=np.float32)
         self.quality_z = np.zeros(self.capacity, dtype=np.float32)
         self.seq_lens = np.zeros(self.capacity, dtype=np.int32)
         self.prompt_uids = np.empty(self.capacity, dtype=object)
+        self.prompt_success_rates = np.full(self.capacity, 0.5, dtype=np.float32)
+        self.prompt_informativeness = np.ones(self.capacity, dtype=np.float32)
+        self.prompt_reward_spans = np.zeros(self.capacity, dtype=np.float32)
 
     def __len__(self) -> int:
         return self.size
@@ -112,9 +132,17 @@ class OffPolicyReplayBuffer:
         insert_index_tensor = torch.as_tensor(insert_indices, dtype=torch.long, device=self.pool.device)
 
         seq_reward = selected.batch["token_level_scores"].sum(dim=-1).detach().to(torch.float32).cpu()
+        seq_mean_entropy = self._extract_seq_mean_entropy(selected)
         response_mask = selected.batch["response_mask"]
         seq_len = response_mask.sum(dim=-1).detach().to(torch.int32).cpu().numpy()
-        quality_z = self._compute_quality_z(seq_reward)
+        uid_array = selected.non_tensor_batch.get("uid")
+        prompt_success_rate, prompt_informativeness, prompt_reward_span = self._compute_prompt_difficulty_features(
+            seq_reward, uid_array
+        )
+        quality_values, lower_is_better = self._compute_quality_values(
+            seq_reward=seq_reward, seq_mean_entropy=seq_mean_entropy
+        )
+        quality_z = self._compute_quality_z(quality_values, lower_is_better=lower_is_better)
 
         for key, value in selected.batch.items():
             source_value = value[source_start : source_start + block_size].detach()
@@ -124,7 +152,6 @@ class OffPolicyReplayBuffer:
         for key, value in selected.non_tensor_batch.items():
             self.non_tensor_pool[key][insert_indices] = value[source_start : source_start + block_size]
 
-        uid_array = selected.non_tensor_batch.get("uid")
         if uid_array is not None:
             self.prompt_uids[insert_indices] = uid_array[source_start : source_start + block_size]
         else:
@@ -132,8 +159,12 @@ class OffPolicyReplayBuffer:
 
         self.source_steps[insert_indices] = int(global_step)
         self.seq_rewards[insert_indices] = seq_reward[source_start : source_start + block_size].numpy()
+        self.seq_mean_entropy[insert_indices] = seq_mean_entropy[source_start : source_start + block_size].numpy()
         self.quality_z[insert_indices] = quality_z[source_start : source_start + block_size]
         self.seq_lens[insert_indices] = seq_len[source_start : source_start + block_size]
+        self.prompt_success_rates[insert_indices] = prompt_success_rate[source_start : source_start + block_size]
+        self.prompt_informativeness[insert_indices] = prompt_informativeness[source_start : source_start + block_size]
+        self.prompt_reward_spans[insert_indices] = prompt_reward_span[source_start : source_start + block_size]
 
         self.position = (self.position + block_size) % self.capacity
         self.size = min(self.size + block_size, self.capacity)
@@ -145,6 +176,8 @@ class OffPolicyReplayBuffer:
         current_step: int,
         quality_alpha: Optional[float] = None,
         uniform_mix: Optional[float] = None,
+        bias_beta: Optional[float] = None,
+        bias_weight_clip: Optional[float] = None,
     ) -> OffPolicySampleMetrics:
         metrics = self._empty_metrics(batch_size)
         if batch_size <= 0 or self.size == 0:
@@ -165,6 +198,16 @@ class OffPolicyReplayBuffer:
         sampled_probabilities = probabilities[sample_positions]
 
         batch = self._gather_batch(sampled_indices)
+        replay_sampling_weight = self._compute_replay_sampling_weight(
+            sampled_probabilities=sampled_probabilities,
+            valid_count=valid_indices.size,
+            bias_beta=bias_beta,
+            bias_weight_clip=bias_weight_clip,
+            device=batch.batch.device,
+        )
+        batch = batch.union(DataProto.from_dict(tensors={"replay_sampling_weight": replay_sampling_weight}))
+        metrics.update(self._compute_sample_health_metrics(batch))
+        metrics.update(self._compute_sample_difficulty_metrics(sampled_indices))
         metrics.update(
             {
                 "off_policy/buffer_size": float(self.size),
@@ -173,9 +216,15 @@ class OffPolicyReplayBuffer:
                 "off_policy/sample_age_mean": float(sampled_ages.mean()),
                 "off_policy/sample_age_max": float(sampled_ages.max()),
                 "off_policy/seq_reward_mean": float(self.seq_rewards[sampled_indices].mean()),
+                "off_policy/sample_seq_mean_entropy_mean": float(self.seq_mean_entropy[sampled_indices].mean()),
                 "off_policy/priority_entropy": self._entropy(probabilities),
                 "off_policy/replay_hit_rate": 1.0,
                 "off_policy/sample_probability_mean": float(sampled_probabilities.mean()),
+                "off_policy/sample_replay_weight_mean": float(replay_sampling_weight.mean().item()),
+                "off_policy/sample_replay_weight_std": float(replay_sampling_weight.std(unbiased=False).item())
+                if replay_sampling_weight.numel() > 1
+                else 0.0,
+                "off_policy/sample_replay_weight_max": float(replay_sampling_weight.max().item()),
             }
         )
         return OffPolicySampleMetrics(metrics=metrics, batch=batch)
@@ -275,11 +324,12 @@ class OffPolicyReplayBuffer:
         if quality_alpha is None:
             quality_alpha = float(self.config.quality_alpha)
         quality_term = np.exp(float(quality_alpha) * self.quality_z[valid_indices])
+        difficulty_term = self._compute_difficulty_priority_term(valid_indices)
         if int(self.config.staleness_horizon) > 0:
             staleness_term = np.exp(-ages / float(self.config.staleness_horizon))
         else:
             staleness_term = np.ones_like(quality_term)
-        priorities = quality_term * staleness_term
+        priorities = quality_term * difficulty_term * staleness_term
         priorities = np.clip(priorities, a_min=1e-8, a_max=None)
         return priorities.astype(np.float64, copy=False)
 
@@ -305,18 +355,242 @@ class OffPolicyReplayBuffer:
         }
         return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
-    def _compute_quality_z(self, seq_reward: torch.Tensor) -> np.ndarray:
-        reward_np = seq_reward.numpy()
-        if reward_np.size <= 1:
-            return np.zeros_like(reward_np, dtype=np.float32)
+    def _compute_replay_sampling_weight(
+        self,
+        sampled_probabilities: np.ndarray,
+        valid_count: int,
+        bias_beta: Optional[float],
+        bias_weight_clip: Optional[float],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if bias_beta is None:
+            bias_beta = float(self.config.replay_bias_beta_start)
+        if bias_weight_clip is None:
+            bias_weight_clip = float(self.config.replay_bias_weight_clip)
 
-        reward_mean = reward_np.mean()
-        reward_std = reward_np.std()
-        if reward_std < 1e-6:
-            z = np.zeros_like(reward_np, dtype=np.float32)
+        sampled_probabilities = np.clip(sampled_probabilities.astype(np.float64, copy=False), a_min=1e-12, a_max=None)
+        valid_count = max(int(valid_count), 1)
+        uniform_probability = 1.0 / float(valid_count)
+        weights = np.power(uniform_probability / sampled_probabilities, float(bias_beta)).astype(np.float64, copy=False)
+        weights = np.clip(weights, a_min=0.0, a_max=float(bias_weight_clip))
+        weights = weights / max(weights.mean(), 1e-12)
+        return torch.as_tensor(weights, dtype=torch.float32, device=device)
+
+    def _compute_sample_health_metrics(self, batch: DataProto) -> dict[str, float]:
+        metrics = {
+            "off_policy/sample_rollout_is_eff_sample_size": 1.0,
+            "off_policy/sample_rollout_is_seq_abs_mean_deviation": 0.0,
+            "off_policy/sample_rollout_is_seq_max_deviation": 0.0,
+        }
+        if "rollout_is_weights" not in batch.batch.keys() or "response_mask" not in batch.batch.keys():
+            return metrics
+
+        response_mask = batch.batch["response_mask"]
+        seq_mask = response_mask.sum(dim=-1) > 0
+        if not torch.any(seq_mask):
+            return metrics
+
+        seq_mean_weight = verl_F.masked_mean(batch.batch["rollout_is_weights"], response_mask, axis=-1)[seq_mask]
+        if seq_mean_weight.numel() == 0:
+            return metrics
+
+        mean_weight = seq_mean_weight.mean()
+        if mean_weight.abs().item() <= 1e-8:
+            ess = 0.0
         else:
-            z = (reward_np - reward_mean) / reward_std
+            normalized_weight = seq_mean_weight / mean_weight
+            ess = float((1.0 / normalized_weight.square().mean()).item())
+
+        seq_deviation = (seq_mean_weight - 1.0).abs()
+        metrics["off_policy/sample_rollout_is_eff_sample_size"] = ess
+        metrics["off_policy/sample_rollout_is_seq_abs_mean_deviation"] = float(seq_deviation.mean().item())
+        metrics["off_policy/sample_rollout_is_seq_max_deviation"] = float(seq_deviation.max().item())
+        return metrics
+
+    def _compute_quality_values(
+        self,
+        seq_reward: torch.Tensor,
+        seq_mean_entropy: torch.Tensor,
+    ) -> tuple[torch.Tensor, bool]:
+        if self.config.quality_metric == "seq_mean_entropy":
+            return seq_mean_entropy, True
+        return seq_reward, False
+
+    def _extract_seq_mean_entropy(self, selected: DataProto) -> torch.Tensor:
+        if "seq_mean_entropy" in selected.batch.keys():
+            return selected.batch["seq_mean_entropy"].detach().to(torch.float32).cpu().reshape(-1)
+
+        if self.config.quality_metric == "seq_mean_entropy":
+            raise ValueError(
+                "quality_metric='seq_mean_entropy' requires seq_mean_entropy in the replay batch, "
+                "but the field is missing."
+            )
+        return torch.zeros(len(selected), dtype=torch.float32)
+
+    def _compute_quality_z(self, quality_values: torch.Tensor, lower_is_better: bool = False) -> np.ndarray:
+        quality_np = quality_values.numpy().astype(np.float32, copy=False)
+        if lower_is_better:
+            quality_np = -quality_np
+        if quality_np.size <= 1:
+            return np.zeros_like(quality_np, dtype=np.float32)
+
+        quality_mean = quality_np.mean()
+        quality_std = quality_np.std()
+        if quality_std < 1e-6:
+            z = np.zeros_like(quality_np, dtype=np.float32)
+        else:
+            z = (quality_np - quality_mean) / quality_std
         return np.clip(z, -2.0, 2.0).astype(np.float32, copy=False)
+
+    def _compute_prompt_difficulty_features(
+        self,
+        seq_reward: torch.Tensor,
+        uid_values: Optional[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self.config.difficulty_metric == "pass_rate":
+            return self._compute_prompt_pass_rate_features(seq_reward, uid_values)
+        return self._compute_prompt_dispersion_features(seq_reward, uid_values)
+
+    def _compute_prompt_pass_rate_features(
+        self,
+        seq_reward: torch.Tensor,
+        uid_values: Optional[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        reward_np = seq_reward.numpy().astype(np.float32, copy=False)
+        total_sequences = reward_np.size
+        if total_sequences == 0:
+            return (
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+            )
+
+        prompt_success_rate = np.full(total_sequences, 0.5, dtype=np.float32)
+        prompt_informativeness = np.ones(total_sequences, dtype=np.float32)
+        prompt_reward_span = np.zeros(total_sequences, dtype=np.float32)
+        if uid_values is None:
+            return prompt_success_rate, prompt_informativeness, prompt_reward_span
+
+        success_mask = reward_np > float(self.config.difficulty_pass_threshold)
+        group_to_indices: dict[object, list[int]] = {}
+        for idx, uid in enumerate(uid_values):
+            group_key = self._normalize_group_key(uid)
+            group_to_indices.setdefault(group_key, []).append(idx)
+
+        for indices in group_to_indices.values():
+            if len(indices) <= 1:
+                continue
+            group_indices = np.asarray(indices, dtype=np.int64)
+            group_success_rate = float(success_mask[group_indices].mean())
+            group_informativeness = float(np.clip(4.0 * group_success_rate * (1.0 - group_success_rate), 0.0, 1.0))
+            prompt_success_rate[group_indices] = group_success_rate
+            prompt_informativeness[group_indices] = group_informativeness
+            prompt_reward_span[group_indices] = float(reward_np[group_indices].max() - reward_np[group_indices].min())
+
+        return prompt_success_rate, prompt_informativeness, prompt_reward_span
+
+    def _compute_prompt_dispersion_features(
+        self,
+        seq_reward: torch.Tensor,
+        uid_values: Optional[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        reward_np = seq_reward.numpy().astype(np.float32, copy=False)
+        total_sequences = reward_np.size
+        if total_sequences == 0:
+            return (
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+            )
+
+        prompt_success_rate = np.full(total_sequences, 0.5, dtype=np.float32)
+        prompt_informativeness = np.ones(total_sequences, dtype=np.float32)
+        prompt_reward_span = np.zeros(total_sequences, dtype=np.float32)
+        if uid_values is None:
+            return prompt_success_rate, prompt_informativeness, prompt_reward_span
+
+        group_to_indices: dict[object, list[int]] = {}
+        for idx, uid in enumerate(uid_values):
+            group_key = self._normalize_group_key(uid)
+            group_to_indices.setdefault(group_key, []).append(idx)
+
+        for indices in group_to_indices.values():
+            if len(indices) <= 1:
+                continue
+
+            group_indices = np.asarray(indices, dtype=np.int64)
+            group_rewards = reward_np[group_indices]
+            reward_min = float(group_rewards.min())
+            reward_max = float(group_rewards.max())
+            reward_span = reward_max - reward_min
+            prompt_reward_span[group_indices] = reward_span
+            if reward_span <= 1e-6:
+                prompt_informativeness[group_indices] = 0.0
+                continue
+
+            normalized_rewards = (group_rewards - reward_min) / reward_span
+            pairwise_distance = np.abs(normalized_rewards[:, None] - normalized_rewards[None, :]).mean()
+            group_informativeness = float(np.clip(2.0 * pairwise_distance, 0.0, 1.0))
+            prompt_informativeness[group_indices] = group_informativeness
+
+        return prompt_success_rate, prompt_informativeness, prompt_reward_span
+
+    def _compute_difficulty_priority_term(self, valid_indices: np.ndarray) -> np.ndarray:
+        if not bool(self.config.enable_difficulty_sampling):
+            return np.ones(valid_indices.shape[0], dtype=np.float64)
+
+        difficulty_alpha = max(float(self.config.difficulty_alpha), 0.0)
+        min_priority_scale = float(np.clip(self.config.difficulty_min_priority_scale, 0.0, 1.0))
+        informativeness = np.nan_to_num(
+            self.prompt_informativeness[valid_indices].astype(np.float64, copy=False),
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        informativeness = np.clip(informativeness, 0.0, 1.0)
+        if difficulty_alpha != 1.0:
+            informativeness = np.power(informativeness, difficulty_alpha).astype(np.float64, copy=False)
+        return min_priority_scale + (1.0 - min_priority_scale) * informativeness
+
+    def _compute_sample_difficulty_metrics(self, sampled_indices: np.ndarray) -> dict[str, float]:
+        metrics = {
+            "off_policy/sample_prompt_success_rate_mean": 0.0,
+            "off_policy/sample_prompt_informativeness_mean": 0.0,
+            "off_policy/sample_prompt_reward_span_mean": 0.0,
+            "off_policy/sample_prompt_easy_fraction": 0.0,
+            "off_policy/sample_prompt_medium_fraction": 0.0,
+            "off_policy/sample_prompt_hard_fraction": 0.0,
+        }
+        if sampled_indices.size == 0:
+            return metrics
+
+        lower_bound, upper_bound = self._get_prompt_difficulty_bucket_bounds()
+        sampled_success_rates = self.prompt_success_rates[sampled_indices].astype(np.float64, copy=False)
+        sampled_informativeness = self.prompt_informativeness[sampled_indices].astype(np.float64, copy=False)
+        sampled_reward_spans = self.prompt_reward_spans[sampled_indices].astype(np.float64, copy=False)
+        if self.config.difficulty_metric == "pass_rate":
+            hard_mask = sampled_success_rates <= lower_bound
+            easy_mask = sampled_success_rates >= upper_bound
+            medium_mask = ~(hard_mask | easy_mask)
+        else:
+            hard_mask = sampled_informativeness <= lower_bound
+            easy_mask = sampled_informativeness >= upper_bound
+            medium_mask = ~(hard_mask | easy_mask)
+
+        metrics["off_policy/sample_prompt_success_rate_mean"] = float(sampled_success_rates.mean())
+        metrics["off_policy/sample_prompt_informativeness_mean"] = float(sampled_informativeness.mean())
+        metrics["off_policy/sample_prompt_reward_span_mean"] = float(sampled_reward_spans.mean())
+        metrics["off_policy/sample_prompt_easy_fraction"] = float(easy_mask.mean())
+        metrics["off_policy/sample_prompt_medium_fraction"] = float(medium_mask.mean())
+        metrics["off_policy/sample_prompt_hard_fraction"] = float(hard_mask.mean())
+        return metrics
+
+    def _get_prompt_difficulty_bucket_bounds(self) -> tuple[float, float]:
+        lower_bound = float(np.clip(self.config.difficulty_medium_lower, 0.0, 1.0))
+        upper_bound = float(np.clip(self.config.difficulty_medium_upper, 0.0, 1.0))
+        if lower_bound > upper_bound:
+            lower_bound, upper_bound = upper_bound, lower_bound
+        return lower_bound, upper_bound
 
     def _empty_metrics(self, requested_batch_size: int) -> dict[str, float]:
         return {
@@ -326,9 +600,22 @@ class OffPolicyReplayBuffer:
             "off_policy/sample_age_mean": 0.0,
             "off_policy/sample_age_max": 0.0,
             "off_policy/seq_reward_mean": 0.0,
+            "off_policy/sample_seq_mean_entropy_mean": 0.0,
             "off_policy/priority_entropy": 0.0,
             "off_policy/replay_hit_rate": 0.0 if requested_batch_size > 0 else 1.0,
             "off_policy/sample_probability_mean": 0.0,
+            "off_policy/sample_replay_weight_mean": 0.0,
+            "off_policy/sample_replay_weight_std": 0.0,
+            "off_policy/sample_replay_weight_max": 0.0,
+            "off_policy/sample_rollout_is_eff_sample_size": 0.0,
+            "off_policy/sample_rollout_is_seq_abs_mean_deviation": 0.0,
+            "off_policy/sample_rollout_is_seq_max_deviation": 0.0,
+            "off_policy/sample_prompt_success_rate_mean": 0.0,
+            "off_policy/sample_prompt_informativeness_mean": 0.0,
+            "off_policy/sample_prompt_reward_span_mean": 0.0,
+            "off_policy/sample_prompt_easy_fraction": 0.0,
+            "off_policy/sample_prompt_medium_fraction": 0.0,
+            "off_policy/sample_prompt_hard_fraction": 0.0,
         }
 
     @staticmethod

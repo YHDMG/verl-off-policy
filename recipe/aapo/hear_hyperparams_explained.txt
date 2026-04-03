@@ -1,0 +1,355 @@
+HEAR 实验脚本超参数说明
+文件来源：recipe/aapo/hear.sh
+整理范围：
+1. replay buffer / off-policy replay
+2. 历史 ratio 矫正
+3. 高熵 token 复用与高熵 guard
+
+说明方式：
+- “当前值”表示 `recipe/aapo/hear.sh` 里现在配置的值。
+- “作用”描述这个参数控制什么。
+- “调大/调小”给出最直接的调参方向。
+
+==================================================
+一、Replay Buffer / Off-policy Replay
+==================================================
+
+1) off_policy_enable=True
+当前值：True
+作用：是否启用 replay buffer 和 off-policy replay。关闭后，训练退回纯 on-policy。
+调参理解：
+- True：启用历史样本复用。
+- False：完全不使用 buffer。
+
+2) off_policy_quality_metric='seq_reward'
+当前值：seq_reward
+作用：定义 replay 样本质量分数的来源。当前实现只支持 `seq_reward`，也就是按序列 reward 给样本排序和加权。
+调参理解：
+- 目前基本不是可自由搜索项，因为 buffer 实现只支持这一种。
+
+3) off_policy_replay_mini_batch_multiplier=1
+当前值：1
+作用：决定每次 actor 更新时，目标 replay batch 大小相对于 actor mini-batch 的倍数。
+实现上大致是：
+replay_batch_size = replay_mini_batch_multiplier * actor_mini_batch_size * rollout_n
+调大：每步混入更多 replay 样本，off-policy 更强。
+调小：更接近 on-policy。
+
+4) off_policy_replay_schedule_type='cosine_decay'
+当前值：cosine_decay
+作用：控制 replay 比例如何随训练进度变化。当前 AAPO 实现只支持余弦衰减。
+调参理解：
+- 起点由 `off_policy_replay_start_ratio` 控制。
+- 终点由 `off_policy_replay_end_ratio` 控制。
+- 中间按余弦曲线平滑下降。
+
+5) off_policy_replay_start_ratio=1.0
+当前值：1.0
+作用：训练初期 replay 使用比例。
+调大：前期更多使用 replay。
+调小：前期更保守。
+
+6) off_policy_replay_end_ratio=0.25
+当前值：0.25
+作用：训练后期 replay 使用比例。
+调大：后期仍保持较强 replay。
+调小：后期更接近纯 on-policy。
+
+7) off_policy_replay_anneal_steps=0
+当前值：0
+作用：replay 比例从 start_ratio 衰减到 end_ratio 所用的步数。
+特殊规则：
+- 如果设为 0，代码会自动退化为使用 `total_training_steps`。
+调大：衰减更慢，更多 step 保持高 replay。
+调小：更快进入低 replay 阶段。
+
+8) off_policy_warmup_steps=5
+当前值：5
+作用：buffer 需要先积累多少“训练 step 的数据”后，才开始真正采样 replay。
+实现上 warmup 大小约等于：
+warmup_steps * train_batch_size * rollout_n
+调大：buffer 更满、更稳后再开始 replay。
+调小：更早开始复用历史样本。
+
+9) off_policy_quality_alpha=0.5
+当前值：0.5
+作用：控制样本质量分数（这里是 seq_reward）的优先采样强度。
+buffer 中优先级大致与 `exp(alpha * quality_z)` 成正相关。
+调大：高 reward 样本更容易被采到。
+调小：采样更平均。
+
+10) off_policy_late_quality_alpha_multiplier=2.0
+当前值：2.0
+作用：训练后期对 `quality_alpha` 的放大倍数。
+实际效果是：随着训练推进，effective_quality_alpha 会逐步从 `quality_alpha` 增长到 `quality_alpha * multiplier`。
+调大：后期更偏向“高质量样本优先”。
+调小：前后期差异更小。
+
+11) off_policy_staleness_horizon=10
+当前值：10
+作用：控制“样本年龄惩罚”的衰减速度。
+buffer 中优先级还会乘上一个随 age 衰减的项，近似为 `exp(-age / horizon)`。
+调大：旧样本衰减更慢，更愿意采旧数据。
+调小：更偏爱新样本。
+
+12) off_policy_uniform_mix=0.3
+当前值：0.3
+作用：优先采样分布和均匀采样分布的混合比例（训练前期的起点值）。
+调大：采样更均匀，探索更强，没那么偏向高 reward 样本。
+调小：更偏向 priority sampling。
+
+13) off_policy_late_uniform_mix=0.05
+当前值：0.05
+作用：训练后期的均匀采样混合比例。
+当前脚本表示：前期 0.3，后期线性降到 0.05，后期更偏向优先采样。
+调大：后期仍保留较强随机性。
+调小：后期几乎全靠优先级挑样本。
+
+14) off_policy_max_age_steps=10
+当前值：10
+作用：buffer 采样时允许的最大样本年龄。超过这个 step 差值的样本直接不参与采样。
+调大：允许更老样本参与 replay。
+调小：只用更近的历史样本。
+
+15) off_policy_zero_adv_epsilon=1e-6
+当前值：1e-6
+作用：过滤“整个 group advantage 几乎全为 0”的样本组，避免把几乎没有学习信号的轨迹放进 buffer。
+调大：过滤更严格。
+调小：保留更多边缘样本。
+
+16) off_policy_cpu_offload=True
+当前值：True
+作用：buffer 是否存放在 CPU 上。打开后更省 GPU 显存，但采样/搬运会更慢一些。
+调参理解：
+- True：更省显存。
+- False：更快，但更占显存。
+
+17) off_policy_capacity_steps=10
+当前值：10
+作用：脚本层面的 buffer 容量控制参数。
+脚本里实际容量为：
+off_policy_capacity = train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps
+在当前脚本下：64 * 8 * 10 = 5120 条序列。
+调大：buffer 更大，历史覆盖更广。
+调小：buffer 更小，更偏近端数据。
+
+
+==================================================
+二、历史 Ratio 矫正（HEAR history correction）
+==================================================
+
+背景：
+当前实现不是直接在 ratio 空间做压缩，而是在 log-ratio 空间维护历史统计。
+健康历史队列按设备维护，每个条目大致记录：
+(mean_log_ratio, std_log_ratio, count, max_log_ratio)
+
+当前触发逻辑：
+- 只看正优势 token。
+- 只在当前 token 的 log_ratio 超过 `max(历史锚点, log(final_clip_high))` 时触发。
+- 触发后使用 `correction_lambda` 把 log_ratio 拉向历史锚点。
+
+1) enable_correction=True
+当前值：True
+作用：是否启用历史 ratio 矫正。
+调参理解：
+- True：使用新的历史 log-ratio correction。
+- False：完全关闭这部分功能。
+
+2) correction_history_size=10
+当前值：10
+作用：历史队列长度，即用最近多少个 step 的健康 log-ratio 统计来构造历史锚点。
+调大：锚点更平滑、更稳，但响应更慢。
+调小：锚点更灵敏，但更抖。
+
+3) correction_beta=1.5
+当前值：1.5
+作用：历史锚点中的尺度系数。
+当前实现里大致是：
+history_anchor = history_mean_log_ratio + beta * history_std_log_ratio
+调大：历史上界更宽，触发 correction 的 token 更少，更保守。
+调小：更容易触发 correction，更激进。
+
+4) correction_lambda=1.0
+当前值：1.0
+作用：触发后把当前 log-ratio 拉回历史锚点的强度。
+当前实现近似为：
+corrected_log_ratio = (current_log_ratio + lambda * history_anchor) / (1 + lambda)
+调大：处罚更强，触发后的 token 被拉回得更狠。
+调小：处罚更弱，更多保留当前更新信号。
+
+补充说明：
+- 旧版脚本里的 `correction_trigger_high` 已经不再是这版核心逻辑的有效调参项。
+- 现在真正决定“触发多少”的主参数，是 `correction_beta` 和 `clip_ratio_high` / `final_clip_high`。
+
+
+==================================================
+三、高熵 token 复用（最后一轮高熵更新）
+==================================================
+
+背景：
+这部分不属于 HEAR 的历史 ratio correction，而是 `dp_actor` 里的另一条训练路径：
+- 仅当 `ppo_epochs` 为偶数时启用。
+- 最后一个 PPO epoch 不再用全部 token，而是只用高熵 token。
+- 如果有 trajectory reward，就优先从“正奖励轨迹”里选高熵 token。
+
+1) high_entropy_ratio=0.2
+当前值：0.2
+作用：最后一轮高熵复用时，保留的高熵 token 比例。
+实现上大致是从候选 token 中取 entropy 最高的前 20%。
+调大：最后一轮覆盖更多 token，更接近常规 PPO。
+调小：最后一轮更聚焦极少数高熵 token。
+
+2) ppo_epochs=2
+当前值：2
+作用：是否能触发“最后一轮高熵复用”的关键外部条件。
+当前逻辑要求：
+- `high_entropy_ratio > 0`
+- `ppo_epochs % 2 == 0`
+- 只在最后一个 epoch 使用高熵 token mask
+调参理解：
+- 偶数才会启用这条路径。
+- 如果你改成奇数，比如 3，这个“最后一轮高熵专用更新”就不会触发。
+
+补充说明：
+- 高熵复用还会受 reward 分布影响。
+- 如果正奖励轨迹很少，最后一轮可能几乎选不到 token，这时 `actor/high_entropy/empty_selection_micro_batch_count` 会变高。
+
+
+==================================================
+四、高熵 Guard（HEAR 内部 clip 保护）
+==================================================
+
+背景：
+这部分属于 HEAR loss 内部逻辑，不是最后一轮高熵复用。
+它的目标是：在 HEAR 做 ratio correction 之前，先对高熵 token 适度放宽 clip 窗口，避免这些高不确定 token 被过早截断。
+
+1) enable_high_entropy_guard=True
+当前值：True
+作用：是否启用高熵 guard。
+调参理解：
+- True：会先选出高熵 token，并尝试扩展 clip window。
+- False：直接使用默认 clip window，不做这层保护。
+
+2) high_entropy_guard_min_ratio=0.2
+当前值：0.2
+作用：guard 的目标覆盖率下限。
+意思是：希望至少有 20% 的高熵 token 落在当前 clip window 内；如果不够，就继续扩窗。
+调大：保护更强，clip 更容易被放宽。
+调小：保护更弱。
+
+3) high_entropy_guard_quantile=0.8
+当前值：0.8
+作用：当没有显式设置 `high_entropy_guard_select_ratio` 时，用熵分位数来确定高熵 token 的集合。
+当前脚本里因为已经显式给了 `select_ratio=0.2`，所以这个值基本不会主导选 token。
+调大：如果它生效，选出来的 token 更少、更“高熵”。
+调小：会选更多 token。
+
+4) high_entropy_guard_select_ratio=0.2
+当前值：0.2
+作用：直接指定被 guard 视为“高熵 token”的比例。
+当前脚本里它优先于 quantile 生效，也就是直接选 top 20% entropy token。
+调大：更多 token 进入 guard 保护集合。
+调小：只有更少、更尖锐的高熵 token 被保护。
+
+5) high_entropy_guard_max_iters=5
+当前值：5
+作用：guard 最多尝试几轮扩展 clip window。
+调大：更有机会满足目标覆盖率，但 clip 可能被放得更宽。
+调小：扩窗更克制。
+
+6) high_entropy_guard_low_step=0.01
+当前值：0.01
+作用：每轮把 clip 下界向外扩展的步长。
+调大：下界放宽更快。
+调小：下界变化更细。
+
+7) high_entropy_guard_high_step=0.01
+当前值：0.01
+作用：每轮把 clip 上界向外扩展的步长。
+调大：上界放宽更快。
+调小：上界变化更细。
+
+8) high_entropy_guard_lower_min=0.7
+当前值：0.7
+作用：clip 下界允许扩展到的最低值。
+也就是 guard 再怎么放宽，下界也不会低于 0.7。
+调小：允许更宽松的下界。
+调大：限制更严格。
+
+9) high_entropy_guard_upper_max=2.0
+当前值：2.0
+作用：clip 上界允许扩展到的最高值。
+也就是 guard 再怎么放宽，上界也不会高于 2.0。
+调大：允许更宽松的上界。
+调小：限制更严格。
+
+10) entropy_history_size=50
+当前值：50
+作用：HEAR 内部保存多少步 entropy 历史，用于 EMA 统计和监控。
+调大：更平滑。
+调小：更灵敏。
+
+11) entropy_ema_beta=0.1
+当前值：0.1
+作用：entropy EMA 的更新系数。
+调大：EMA 更快跟踪当前变化。
+调小：EMA 更平滑、更慢。
+
+
+==================================================
+五、最值得优先调的参数
+==================================================
+
+如果你只想抓最关键的几个参数，建议优先看：
+
+1. replay buffer：
+- off_policy_replay_mini_batch_multiplier
+- off_policy_quality_alpha
+- off_policy_uniform_mix
+- off_policy_max_age_steps
+- off_policy_capacity_steps
+
+2. ratio 矫正：
+- correction_beta
+- correction_lambda
+- correction_history_size
+
+3. 高熵 token 复用 / guard：
+- high_entropy_ratio
+- high_entropy_guard_min_ratio
+- high_entropy_guard_select_ratio
+- high_entropy_guard_upper_max
+
+
+==================================================
+六、按用途给一个快速调参建议
+==================================================
+
+如果你希望 replay 更强：
+- 提高 `off_policy_replay_mini_batch_multiplier`
+- 提高 `off_policy_replay_end_ratio`
+- 增大 `off_policy_capacity_steps`
+
+如果你希望 replay 更偏向高质量样本：
+- 提高 `off_policy_quality_alpha`
+- 提高 `off_policy_late_quality_alpha_multiplier`
+- 降低 `off_policy_uniform_mix`
+
+如果你希望 ratio 矫正更保守：
+- 提高 `correction_beta`
+- 降低 `correction_lambda`
+- 增大 `correction_history_size`
+
+如果你希望 ratio 矫正更积极：
+- 降低 `correction_beta`
+- 提高 `correction_lambda`
+- 减小 `correction_history_size`
+
+如果你希望高熵 token 保护更强：
+- 提高 `high_entropy_guard_min_ratio`
+- 提高 `high_entropy_guard_select_ratio`
+- 提高 `high_entropy_guard_upper_max`
+
+如果你希望最后一轮高熵复用更聚焦：
+- 降低 `high_entropy_ratio`
+

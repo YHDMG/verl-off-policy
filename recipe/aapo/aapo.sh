@@ -76,7 +76,7 @@ clip_ratio_high=0.28
 # Start with a conservative replay setting so we can first validate that replay
 # metrics move in the expected direction without destabilizing training.
 off_policy_enable=True
-off_policy_quality_metric='seq_reward'
+off_policy_quality_metric='seq_mean_entropy'
 off_policy_replay_mini_batch_multiplier=1
 off_policy_replay_schedule_type='cosine_decay'
 off_policy_replay_start_ratio=1.0
@@ -92,6 +92,13 @@ off_policy_max_age_steps=10
 off_policy_zero_adv_epsilon=1e-6
 off_policy_cpu_offload=True
 off_policy_capacity_steps=10
+off_policy_enable_difficulty_sampling=True
+off_policy_difficulty_metric='pass_rate'
+off_policy_difficulty_pass_threshold=0.9
+off_policy_difficulty_alpha=1.0
+off_policy_difficulty_min_priority_scale=0.5
+off_policy_difficulty_medium_lower=0.25
+off_policy_difficulty_medium_upper=0.75
 
 # ================================ Response length parameters ================================
 max_prompt_length=1024
@@ -170,6 +177,13 @@ python3 -m recipe.aapo.main_aapo \
     algorithm.off_policy.max_age_steps="${off_policy_max_age_steps}" \
     algorithm.off_policy.zero_adv_epsilon="${off_policy_zero_adv_epsilon}" \
     algorithm.off_policy.cpu_offload="${off_policy_cpu_offload}" \
+    algorithm.off_policy.enable_difficulty_sampling="${off_policy_enable_difficulty_sampling}" \
+    algorithm.off_policy.difficulty_metric="${off_policy_difficulty_metric}" \
+    algorithm.off_policy.difficulty_pass_threshold="${off_policy_difficulty_pass_threshold}" \
+    algorithm.off_policy.difficulty_alpha="${off_policy_difficulty_alpha}" \
+    algorithm.off_policy.difficulty_min_priority_scale="${off_policy_difficulty_min_priority_scale}" \
+    algorithm.off_policy.difficulty_medium_lower="${off_policy_difficulty_medium_lower}" \
+    algorithm.off_policy.difficulty_medium_upper="${off_policy_difficulty_medium_upper}" \
     actor_rollout_ref.actor.use_kl_loss="${use_kl_loss}" \
     actor_rollout_ref.actor.kl_loss_coef="${kl_loss_coef}" \
     actor_rollout_ref.actor.kl_loss_type="${kl_loss_type}" \

@@ -628,6 +628,8 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        if "replay_sampling_weight" in data.batch.keys():
+            select_keys.append("replay_sampling_weight")
         if "token_level_rewards" in data.batch.keys():
             select_keys.append("token_level_rewards")
         elif "token_level_scores" in data.batch.keys():
@@ -735,6 +737,17 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    replay_sampling_weight = model_inputs.get("replay_sampling_weight", None)
+                    effective_pg_weight = None
+                    if replay_sampling_weight is not None:
+                        replay_sampling_weight = replay_sampling_weight.to(log_prob.dtype).unsqueeze(-1)
+                        replay_sampling_weight = replay_sampling_weight * response_mask.to(log_prob.dtype)
+                    if rollout_is_weights is not None and replay_sampling_weight is not None:
+                        effective_pg_weight = rollout_is_weights * replay_sampling_weight
+                    elif rollout_is_weights is not None:
+                        effective_pg_weight = rollout_is_weights
+                    elif replay_sampling_weight is not None:
+                        effective_pg_weight = replay_sampling_weight
 
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
@@ -748,7 +761,7 @@ class DataParallelPPOActor(BasePPOActor):
                         "response_mask": response_mask,
                         "loss_agg_mode": loss_agg_mode,
                         "config": self.config,
-                        "rollout_is_weights": rollout_is_weights,
+                        "rollout_is_weights": effective_pg_weight,
                     }
                     if loss_mode == "hear":
                         try:

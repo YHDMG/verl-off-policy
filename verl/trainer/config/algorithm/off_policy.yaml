@@ -26,7 +26,9 @@ replay_end_ratio: 0.25
 replay_anneal_steps: 0
 
 # Quality metric used to prioritize samples.
-quality_metric: seq_reward
+# - seq_mean_entropy: lower sequence mean entropy gets higher replay priority
+# - seq_reward: higher sequence reward gets higher replay priority
+quality_metric: seq_mean_entropy
 
 # Exponential weight applied to normalized quality scores.
 quality_alpha: 1.0
@@ -51,3 +53,50 @@ zero_adv_epsilon: 1e-6
 
 # Store replay tensors on CPU instead of keeping their original device.
 cpu_offload: true
+
+# Starting beta for replay sampling bias correction.
+replay_bias_beta_start: 0.4
+
+# Final beta for replay sampling bias correction.
+replay_bias_beta_end: 1.0
+
+# Maximum replay bias correction weight before batch renormalization.
+replay_bias_weight_clip: 5.0
+
+# EMA coefficient for replay health statistics.
+replay_health_ema_beta: 0.2
+
+# Target normalized ESS for sampled replay batches.
+replay_health_target_ess: 0.6
+
+# Target mean sequence-level deviation of rollout IS weights from 1.
+replay_health_target_seq_dev: 0.15
+
+# Extra uniform mixture added when replay health degrades.
+replay_health_uniform_mix_boost: 0.3
+
+# Minimum multiplier applied to quality_alpha under poor replay health.
+replay_health_alpha_min_scale: 0.25
+
+# Whether to prioritize informative prompt groups in replay sampling.
+enable_difficulty_sampling: false
+
+# Prompt-level difficulty scoring mode.
+# - pass_rate: use grouped pass rate based on difficulty_pass_threshold
+# - group_relative_dispersion: use within-uid reward dispersion only, no global pass threshold
+difficulty_metric: pass_rate
+
+# Sequence reward threshold used only when difficulty_metric=pass_rate.
+difficulty_pass_threshold: 0.9
+
+# Exponent applied to prompt informativeness before converting it into a priority multiplier.
+difficulty_alpha: 1.0
+
+# Minimum priority multiplier reserved for very easy or very hard prompt groups.
+difficulty_min_priority_scale: 0.5
+
+# Prompt groups with informativeness <= this value are logged as low-info.
+difficulty_medium_lower: 0.25
+
+# Prompt groups with informativeness >= this value are logged as high-info.
+difficulty_medium_upper: 0.75

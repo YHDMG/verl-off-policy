@@ -90,6 +90,12 @@ policy_loss:
   # Upper trigger threshold for HEAR correction
   correction_trigger_high: 20.0
 
+  # Scale coefficient for historical log-ratio anchor: m = mean + beta * std
+  correction_beta: 1.0
+
+  # Strength of pulling log-ratio back to the historical anchor
+  correction_lambda: 1.0
+
   # Enable high-entropy guard in HEAR
   enable_high_entropy_guard: false
 
@@ -304,4 +310,3 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
-
