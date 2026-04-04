@@ -351,6 +351,12 @@ def _adjust_clip_for_high_entropy_tokens(
         "high_entropy_guard/clip_low_delta": 0.0,
         "high_entropy_guard/clip_high_delta": 0.0,
         "high_entropy_guard/coverage_delta": 0.0,
+        "high_entropy_guard/invoked_batch_count": 0.0,
+        "high_entropy_guard/needs_adjustment_batch_count": 0.0,
+        "high_entropy_guard/adjusted_batch_count": 0.0,
+        "high_entropy_guard/clip_low_delta_max": 0.0,
+        "high_entropy_guard/clip_high_delta_max": 0.0,
+        "high_entropy_guard/coverage_delta_max": 0.0,
 
     }
 
@@ -385,6 +391,7 @@ def _adjust_clip_for_high_entropy_tokens(
         stats["high_entropy_guard/coverage_delta"] = 0.0
         return ratio_low_cur, ratio_high_cur, 0.0, stats
 
+    stats["high_entropy_guard/invoked_batch_count"] = 1.0
     coverage_before = _compute_high_entropy_coverage(
         ratio=corrected_ratio,
         response_mask=response_mask,
@@ -409,6 +416,7 @@ def _adjust_clip_for_high_entropy_tokens(
         stats["high_entropy_guard/coverage_delta"] = 0.0  # coverage 没有变化
         return ratio_low_cur, ratio_high_cur, float(coverage_before), stats
 
+    stats["high_entropy_guard/needs_adjustment_batch_count"] = 1.0
     low_step = float(max(low_step, 0.0))
     high_step = float(max(high_step, 0.0))
     ratio_low_min = float(min(ratio_low_min, ratio_low_cur))
@@ -453,6 +461,10 @@ def _adjust_clip_for_high_entropy_tokens(
     stats["high_entropy_guard/clip_low_delta"] = float(ratio_low_cur - ratio_low_initial)
     stats["high_entropy_guard/clip_high_delta"] = float(ratio_high_cur - ratio_high_initial)
     stats["high_entropy_guard/coverage_delta"] = float(achieved - coverage_before)
+    stats["high_entropy_guard/adjusted_batch_count"] = 1.0 if iterations_used > 0 else 0.0
+    stats["high_entropy_guard/clip_low_delta_max"] = abs(float(ratio_low_cur - ratio_low_initial))
+    stats["high_entropy_guard/clip_high_delta_max"] = abs(float(ratio_high_cur - ratio_high_initial))
+    stats["high_entropy_guard/coverage_delta_max"] = abs(float(achieved - coverage_before))
     return ratio_low_cur, ratio_high_cur, float(achieved), stats
 PolicyLossFn = Callable[
     [
@@ -2047,8 +2059,15 @@ def compute_policy_loss_hear(
             for key, value in high_entropy_stats.items():
                 storage_dict[key] = float(value)
         if high_entropy_guard_stats is not None:
+            guard_invoked = bool(high_entropy_guard_stats.get("high_entropy_guard/invoked_batch_count", 0.0) > 0.0)
+            guard_needs_adjustment = bool(
+                high_entropy_guard_stats.get("high_entropy_guard/needs_adjustment_batch_count", 0.0) > 0.0
+            )
             for key, value in high_entropy_guard_stats.items():
-                storage_dict[key] = float(value)
+                if key.endswith(("_count", "_max")):
+                    storage_dict[key] = float(value)
+                elif guard_invoked and guard_needs_adjustment:
+                    storage_dict[key] = float(value)
 
         # 熵相关指标
         if entropy_mean_value is not None:

@@ -71,8 +71,8 @@ correction_lambda=1.0
 
 enable_high_entropy_guard=True
 # Guard coverage is measured on the selected HEAR token subset, not on all response tokens.
-high_entropy_guard_min_ratio=0.9
-high_entropy_guard_select_ratio=0.4
+high_entropy_guard_min_ratio=0.9995
+high_entropy_guard_select_ratio=0.2
 high_entropy_guard_max_iters=25
 high_entropy_guard_low_step=0.01
 high_entropy_guard_high_step=0.05
@@ -93,10 +93,10 @@ off_policy_replay_end_ratio=0.25
 off_policy_replay_anneal_steps=0
 off_policy_warmup_steps=4
 off_policy_quality_alpha=0.5
-off_policy_late_quality_alpha_multiplier=2.0
+off_policy_late_quality_alpha_multiplier=1.0
 off_policy_staleness_horizon=4
 off_policy_uniform_mix=0.3
-off_policy_late_uniform_mix=0.05
+off_policy_late_uniform_mix=0.3
 off_policy_max_age_steps=4
 off_policy_zero_adv_epsilon=1e-6
 off_policy_cpu_offload=True
@@ -128,7 +128,7 @@ actor_offload=False
 rollout_gpu_memory_utilization=0.8
 
 # ================================ Batch parameters ================================
-train_prompt_bsz=64
+train_prompt_bsz=32
 n_resp_per_prompt=8
 ppo_mini_batch_size=16
 ppo_micro_batch_size_per_gpu=4
@@ -139,7 +139,7 @@ ref_log_prob_micro_batch_size_per_gpu=4
 off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps))
 
 # ================================ Training schedule ================================
-test_freq=10
+test_freq=5
 save_freq=50
 total_epochs=1
 total_training_steps=500
