@@ -105,6 +105,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.high_entropy_ratio = max(0.0, min(1.0, float(self.config.get("high_entropy_ratio", 0.2))))
         if torch.distributed.get_rank() == 0:
             print(f"{role} high_entropy_ratio={self.high_entropy_ratio}")
+        self.high_entropy_last_epoch_enabled = bool(self.config.get("high_entropy_last_epoch_enabled", False))
+        if torch.distributed.get_rank() == 0:
+            print(f"{role} high_entropy_last_epoch_enabled={self.high_entropy_last_epoch_enabled}")
 
         # Sum of squared probabilities computation (for optimal_token_baseline)
         # Only initialize if calculate_sum_pi_squared config is enabled
@@ -118,6 +121,13 @@ class DataParallelPPOActor(BasePPOActor):
                 "calculate_sum_pi_squared is not supported with "
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
+
+    def _should_use_high_entropy_last_epoch(self, epoch_idx: int) -> bool:
+        return (
+            self.high_entropy_last_epoch_enabled
+            and self.high_entropy_ratio > 0.0
+            and epoch_idx == self.config.ppo_epochs - 1
+        )
 
     def _apply_high_entropy_mask(
         self, entropy: torch.Tensor, original_mask: torch.Tensor
@@ -658,11 +668,7 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/kl_loss": 0.0,
         }
         for epoch_idx in range(self.config.ppo_epochs):
-            use_high_entropy_only = (
-                self.high_entropy_ratio > 0.0
-                and self.config.ppo_epochs % 2 == 0
-                and epoch_idx == self.config.ppo_epochs - 1
-            )
+            use_high_entropy_only = self._should_use_high_entropy_last_epoch(epoch_idx)
             if use_high_entropy_only and torch.distributed.get_rank() == 0:
                 print(
                     f"Epoch {epoch_idx + 1}/{self.config.ppo_epochs}: "

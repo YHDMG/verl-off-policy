@@ -74,6 +74,8 @@ class TestActorConfig(unittest.TestCase):
 
         self.assertIsInstance(config, ActorConfig)
         self.assertEqual(config.strategy, "fsdp")
+        self.assertFalse(config.high_entropy_last_epoch_enabled)
+        self.assertFalse(hasattr(config.policy_loss, "correction_trigger_high"))
 
     def test_fsdp_actor_config_from_yaml(self):
         """Test creating FSDPActorConfig from YAML file."""

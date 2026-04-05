@@ -82,7 +82,6 @@ actor_rollout_ref:
       entropy_ema_beta: 0.1
       enable_correction: true
       correction_history_size: 10
-      correction_trigger_high: 20.0
       correction_beta: 1.0
       correction_lambda: 1.0
       enable_high_entropy_guard: false

@@ -64,6 +64,7 @@ clip_ratio_high=0.28
 
 # ================================ HEAR parameters ================================
 high_entropy_ratio=0.2
+high_entropy_last_epoch_enabled=True
 enable_correction=True
 correction_history_size=10
 correction_beta=1.5
@@ -85,6 +86,8 @@ entropy_coeff=1e-4
 
 # ================================ Off-policy replay parameters ================================
 off_policy_enable=True
+# `seq_mean_entropy` prioritizes lower-entropy sequences and can couple with HEAR's
+# high-entropy protection. For attribution runs, compare both `seq_mean_entropy` and `seq_reward`.
 off_policy_quality_metric='seq_mean_entropy'
 off_policy_replay_mini_batch_multiplier=1
 off_policy_replay_schedule_type='cosine_decay'
@@ -108,6 +111,44 @@ off_policy_difficulty_alpha=1.0
 off_policy_difficulty_min_priority_scale=0.5
 off_policy_difficulty_medium_lower=0.25
 off_policy_difficulty_medium_upper=0.75
+
+# ================================ Ablation presets ================================
+# ppo_baseline: replay / correction / guard / last_epoch all disabled
+# replay_only: only replay enabled
+# hear_only: HEAR correction / guard / last_epoch enabled, replay disabled
+# full_hear: replay + HEAR all enabled
+ablation_mode='full_hear'
+
+case "${ablation_mode}" in
+  ppo_baseline)
+    off_policy_enable=False
+    enable_correction=False
+    enable_high_entropy_guard=False
+    high_entropy_last_epoch_enabled=False
+    ;;
+  replay_only)
+    off_policy_enable=True
+    enable_correction=False
+    enable_high_entropy_guard=False
+    high_entropy_last_epoch_enabled=False
+    ;;
+  hear_only)
+    off_policy_enable=False
+    enable_correction=True
+    enable_high_entropy_guard=True
+    high_entropy_last_epoch_enabled=True
+    ;;
+  full_hear)
+    off_policy_enable=True
+    enable_correction=True
+    enable_high_entropy_guard=True
+    high_entropy_last_epoch_enabled=True
+    ;;
+  *)
+    echo "Unknown ablation_mode: ${ablation_mode}" >&2
+    exit 1
+    ;;
+esac
 
 # ================================ Response length parameters ================================
 max_prompt_length=1024
@@ -200,13 +241,14 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.clip_ratio_low="${clip_ratio_low}" \
     actor_rollout_ref.actor.clip_ratio_high="${clip_ratio_high}" \
     actor_rollout_ref.actor.high_entropy_ratio="${high_entropy_ratio}" \
+    actor_rollout_ref.actor.high_entropy_last_epoch_enabled="${high_entropy_last_epoch_enabled}" \
     actor_rollout_ref.actor.policy_loss.enable_correction="${enable_correction}" \
     actor_rollout_ref.actor.policy_loss.correction_history_size="${correction_history_size}" \
     actor_rollout_ref.actor.policy_loss.correction_beta="${correction_beta}" \
     actor_rollout_ref.actor.policy_loss.correction_lambda="${correction_lambda}" \
     actor_rollout_ref.actor.policy_loss.enable_high_entropy_guard="${enable_high_entropy_guard}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_min_ratio="${high_entropy_guard_min_ratio}" \
-        actor_rollout_ref.actor.policy_loss.high_entropy_guard_select_ratio="${high_entropy_guard_select_ratio}" \
+    actor_rollout_ref.actor.policy_loss.high_entropy_guard_select_ratio="${high_entropy_guard_select_ratio}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_max_iters="${high_entropy_guard_max_iters}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_low_step="${high_entropy_guard_low_step}" \
     actor_rollout_ref.actor.policy_loss.high_entropy_guard_high_step="${high_entropy_guard_high_step}" \

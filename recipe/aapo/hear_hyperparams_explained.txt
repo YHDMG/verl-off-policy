@@ -179,7 +179,8 @@ corrected_log_ratio = (current_log_ratio + lambda * history_anchor) / (1 + lambd
 
 补充说明：
 - 旧版脚本里的 `correction_trigger_high` 已经不再是这版核心逻辑的有效调参项。
-- 现在真正决定“触发多少”的主参数，是 `correction_beta` 和 `clip_ratio_high` / `final_clip_high`。
+- 现在真正决定“触发多少”的主参数，是 `correction_beta` 和 `clip_ratio_high` / `default_high`。
+- 历史队列只会记录“正优势且未超过默认上界”的 token，不再跟随高熵 guard 放宽后的 clip 上界一起漂移。
 
 
 ==================================================
@@ -188,7 +189,7 @@ corrected_log_ratio = (current_log_ratio + lambda * history_anchor) / (1 + lambd
 
 背景：
 这部分不属于 HEAR 的历史 ratio correction，而是 `dp_actor` 里的另一条训练路径：
-- 仅当 `ppo_epochs` 为偶数时启用。
+- 仅当 `high_entropy_last_epoch_enabled=True` 时启用。
 - 最后一个 PPO epoch 不再用全部 token，而是只用高熵 token。
 - 如果有 trajectory reward，就优先从“正奖励轨迹”里选高熵 token。
 
@@ -199,16 +200,16 @@ corrected_log_ratio = (current_log_ratio + lambda * history_anchor) / (1 + lambd
 调大：最后一轮覆盖更多 token，更接近常规 PPO。
 调小：最后一轮更聚焦极少数高熵 token。
 
-2) ppo_epochs=2
-当前值：2
-作用：是否能触发“最后一轮高熵复用”的关键外部条件。
+2) high_entropy_last_epoch_enabled=True
+当前值：True
+作用：是否显式启用“最后一轮高熵复用”。
 当前逻辑要求：
+- `high_entropy_last_epoch_enabled=True`
 - `high_entropy_ratio > 0`
-- `ppo_epochs % 2 == 0`
 - 只在最后一个 epoch 使用高熵 token mask
 调参理解：
-- 偶数才会启用这条路径。
-- 如果你改成奇数，比如 3，这个“最后一轮高熵专用更新”就不会触发。
+- True：最后一个 epoch 会切到高熵 token 专用更新。
+- False：即使 `ppo_epochs=2` 或其他偶数，这条路径也不会触发。
 
 补充说明：
 - 高熵复用还会受 reward 分布影响。
@@ -221,7 +222,7 @@ corrected_log_ratio = (current_log_ratio + lambda * history_anchor) / (1 + lambd
 
 背景：
 这部分属于 HEAR loss 内部逻辑，不是最后一轮高熵复用。
-它的目标是：在 HEAR 做 ratio correction 之前，先对高熵 token 适度放宽 clip 窗口，避免这些高不确定 token 被过早截断。
+它的目标是：在 HEAR 完成 history ratio correction 之后，再对高熵 token 适度放宽 clip 窗口，避免这些高不确定 token 仍然被 clip 过早截断。
 
 1) enable_high_entropy_guard=True
 当前值：True
@@ -352,4 +353,3 @@ corrected_log_ratio = (current_log_ratio + lambda * history_anchor) / (1 + lambd
 
 如果你希望最后一轮高熵复用更聚焦：
 - 降低 `high_entropy_ratio`
-

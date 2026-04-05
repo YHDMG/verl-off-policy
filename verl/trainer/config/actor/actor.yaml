@@ -87,9 +87,6 @@ policy_loss:
   # Maximum history size used by HEAR correction
   correction_history_size: 10
 
-  # Upper trigger threshold for HEAR correction
-  correction_trigger_high: 20.0
-
   # Scale coefficient for historical log-ratio anchor: m = mean + beta * std
   correction_beta: 1.0
 
@@ -137,8 +134,10 @@ loss_scale_factor: null
 entropy_coeff: 0
 
 # Ratio used by dp actor high-entropy token reuse on the last PPO epoch
-# The reuse path is enabled only when ppo_epochs is even.
 high_entropy_ratio: 0.2
+
+# Whether to reserve the final PPO epoch for the high-entropy-only update path
+high_entropy_last_epoch_enabled: false
 
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false

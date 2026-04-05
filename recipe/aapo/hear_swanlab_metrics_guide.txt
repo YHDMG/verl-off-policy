@@ -15,6 +15,11 @@ HEAR / AAPO / SwanLab 指标说明（按当前工程实现整理）
 - verl/trainer/ppo/rollout_corr_helper.py
 - verl/trainer/ppo/ray_trainer.py
 
+更新说明：
+- 当前实现里，HEAR 的 history correction 先于高熵 guard。
+- `actor/hear_high_entropy_guard/*` 里的覆盖率，都是在 `corrected_ratio` 上评估的。
+- history 队列只统计“正优势且未超过默认 clip 上界”的 token，不再跟随 guard 放宽后的上界。
+
 ==================================================
 1. 训练流程级指标
 ==================================================
@@ -185,7 +190,7 @@ actor/hear_ratio/pos_adv_min
 - 正优势 token 的原始 importance ratio 最小值。
 
 actor/hear_ratio/pos_adv_exceed_high
-- 正优势 token 中，超过最终 clip 上界的比例。
+- 正优势 token 中，超过默认 clip 上界的比例。
 
 actor/hear_ratio/pos_adv_count
 - 正优势有效 token 数量。
@@ -203,7 +208,7 @@ actor/hear_ratio/neg_adv_min
 - 负优势 token 的原始 importance ratio 最小值。
 
 actor/hear_ratio/neg_adv_below_low
-- 负优势 token 中，低于最终 clip 下界的比例。
+- 负优势 token 中，低于默认 clip 下界的比例。
 
 actor/hear_ratio/neg_adv_count
 - 负优势有效 token 数量。
@@ -215,11 +220,27 @@ actor/hear_ratio/correction_mean_diff
 - 被修改 token 上，矫正前后 ratio 的平均绝对差。
 - 越大表示历史 ratio correction 介入得越强。
 
+actor/hear_ratio/correction_trigger_count
+- 满足 history correction 触发条件的正优势 token 数量。
+
+actor/hear_ratio/correction_success_count
+- 触发 correction 后，被拉回默认 clip 上界以内的 token 数量。
+
+actor/hear_ratio/history_update_frequency
+- 本批是否成功向 history 队列写入了新的健康 log-ratio 统计。
+- 1 表示写入，0 表示没有可写入的健康 token。
+
+actor/hear_ratio/history_mean_log_ratio
+- 当前 history 队列里的加权平均 log-ratio。
+
+actor/hear_ratio/history_max_log_ratio
+- 当前 history 队列里记录到的最大 log-ratio。
+
 ==================================================
 4. 高熵 token 复用 / 最后一轮高熵更新指标（dp_actor）
 ==================================================
 
-说明：这组指标对应 `dp_actor.py` 中“偶数个 PPO epoch 的最后一轮，只用高熵 token 更新”的逻辑。
+说明：这组指标对应 `dp_actor.py` 中“显式开启 `high_entropy_last_epoch_enabled` 后，最后一轮只用高熵 token 更新”的逻辑。
 命名通常是 `actor/high_entropy/*`，与 HEAR 内部的 `actor/hear_high_entropy/*` 不是一回事。
 
 actor/high_entropy/selected_ratio
@@ -498,4 +519,3 @@ variance_proxy/expected_w
 - 是否启用 replay/off_policy
 - 是否启用 rollout correction
 - 当前 actor 后端是 dp 还是 megatron
-

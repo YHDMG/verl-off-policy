@@ -98,7 +98,6 @@ class PolicyLossConfig(BaseConfig):
     entropy_ema_beta: float = 0.1
     enable_correction: bool = True
     correction_history_size: int = 10
-    correction_trigger_high: float = 20.0
     correction_beta: float = 1.0
     correction_lambda: float = 1.0
     enable_high_entropy_guard: bool = False
@@ -137,7 +136,8 @@ class ActorConfig(BaseConfig):
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
         high_entropy_ratio (float): Ratio used by dp actor high-entropy token reuse on the last PPO epoch.
-            The reuse path is activated when `ppo_epochs` is even and the final epoch is reserved for it.
+        high_entropy_last_epoch_enabled (bool): Whether to reserve the final PPO epoch for the
+            high-entropy-only update path.
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.
@@ -180,6 +180,7 @@ class ActorConfig(BaseConfig):
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
     high_entropy_ratio: float = 0.2
+    high_entropy_last_epoch_enabled: bool = False
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
