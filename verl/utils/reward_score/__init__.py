@@ -45,7 +45,16 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+    elif data_source in [
+        "lighteval/MATH",
+        "DigitalLearningGmbH/MATH-lighteval",
+        "HuggingFaceH4/MATH-500",
+        "AIM24/aime24",
+        "deepmath-103k",
+        "minerva/test",
+        "oly/test",
+        "MATH500",
+    ]:
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)
@@ -102,6 +111,10 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
+    elif data_source == "code":
+        from .coder1 import compute_score as coder1_compute_score
+
+        res = coder1_compute_score(solution_str, ground_truth, extra_info)
 
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")

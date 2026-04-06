@@ -428,6 +428,63 @@ class RayPPOTrainer:
         print(f"Dumped generations to {filename}")
         print(f"Dumped response texts to {response_filename}")
 
+    def _dump_validation_question_accuracy(
+        self,
+        inputs,
+        gts,
+        scores,
+        sample_uids,
+        data_sources,
+        dump_path,
+        correct_threshold: float = 0.9,
+    ):
+        """Dump per-question validation accuracy aggregated across repeated responses."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.per_question_accuracy.jsonl")
+
+        uid_to_entry = {}
+        uid_order = []
+        for sample_idx, (uid, data_source, input_text, gt, score) in enumerate(
+            zip(sample_uids, data_sources, inputs, gts, scores, strict=True)
+        ):
+            uid_str = str(uid)
+            if uid_str not in uid_to_entry:
+                uid_to_entry[uid_str] = {
+                    "uid": uid_str,
+                    "data_source": str(data_source),
+                    "input": input_text,
+                    "gts": gt,
+                    "step": int(self.global_steps),
+                    "num_responses": 0,
+                    "correct_count": 0,
+                    "accuracy": 0.0,
+                    "raw_scores": [],
+                    "binary_scores": [],
+                    "sample_indices": [],
+                }
+                uid_order.append(uid_str)
+
+            entry = uid_to_entry[uid_str]
+            score_value = float(score)
+            is_correct = 1 if score_value > correct_threshold else 0
+            entry["num_responses"] += 1
+            entry["correct_count"] += is_correct
+            entry["raw_scores"].append(score_value)
+            entry["binary_scores"].append(is_correct)
+            entry["sample_indices"].append(sample_idx)
+
+        lines = []
+        for uid_str in uid_order:
+            entry = uid_to_entry[uid_str]
+            num_responses = max(int(entry["num_responses"]), 1)
+            entry["accuracy"] = float(entry["correct_count"] / num_responses)
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"Dumped per-question validation accuracy to {filename}")
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -610,12 +667,21 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            data_sources = np.concatenate(data_source_lst, axis=0)
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+            )
+            self._dump_validation_question_accuracy(
+                inputs=sample_inputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                sample_uids=sample_uids,
+                data_sources=data_sources.tolist(),
                 dump_path=val_data_dir,
             )
 
