@@ -1,4 +1,4 @@
-﻿"""Math-only entropy analysis toolkit for offline reasoning studies."""
+"""Math-only entropy analysis toolkit for offline reasoning studies."""
 
 from .dataset import REQUIRED_COLUMNS, load_problem_records, normalize_problem_records, write_parquet_records
 from .features import compute_sequence_features

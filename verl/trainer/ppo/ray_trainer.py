@@ -290,6 +290,12 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.save_best_checkpoint = bool(self.config.trainer.get("save_best_checkpoint", False))
+        self.best_metric_key = self.config.trainer.get("best_metric_key", None)
+        self.best_val_metric = None
+        self._warned_missing_best_metric = False
+        if self.config.trainer.resume_mode != "disable":
+            self._load_best_metric_state()
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -308,6 +314,121 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+
+    def _get_best_checkpoint_dir(self) -> str:
+        return os.path.join(self.config.trainer.default_local_dir, "best_checkpoint")
+
+    def _get_best_metric_info_path(self) -> str:
+        return os.path.join(self._get_best_checkpoint_dir(), "best_metric_info.txt")
+
+    def _load_best_metric_state(self) -> None:
+        best_metric_info_path = self._get_best_metric_info_path()
+        if not os.path.exists(best_metric_info_path):
+            return
+
+        best_metric_info = {}
+        with open(best_metric_info_path, encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                best_metric_info[key.strip()] = value.strip()
+
+        saved_metric_key = best_metric_info.get("metric_key")
+        saved_metric_value = best_metric_info.get("metric_value")
+        if saved_metric_value is None:
+            return
+
+        try:
+            saved_metric_value = float(saved_metric_value)
+        except ValueError:
+            print(f"Ignoring malformed best metric value in {best_metric_info_path}: {saved_metric_value}")
+            return
+
+        if self.best_metric_key and saved_metric_key and self.best_metric_key != saved_metric_key:
+            print(
+                "Ignoring saved best checkpoint metric state because configured trainer.best_metric_key "
+                f"({self.best_metric_key}) differs from saved metric_key ({saved_metric_key})."
+            )
+            return
+
+        if self.best_metric_key is None and saved_metric_key:
+            self.best_metric_key = saved_metric_key
+
+        self.best_val_metric = saved_metric_value
+        print(
+            "Loaded best checkpoint metric state: "
+            f"metric_key={self.best_metric_key}, metric_value={self.best_val_metric}"
+        )
+
+    def _resolve_best_metric_key(self, val_metrics: dict[str, Any]) -> Optional[str]:
+        if self.best_metric_key is not None:
+            if self.best_metric_key in val_metrics:
+                self._warned_missing_best_metric = False
+                return self.best_metric_key
+            if not self._warned_missing_best_metric:
+                print(
+                    "Best checkpoint metric key not found in validation metrics: "
+                    f"{self.best_metric_key}. Available val-core metrics: "
+                    f"{sorted(k for k in val_metrics if k.startswith('val-core/'))}"
+                )
+                self._warned_missing_best_metric = True
+            return None
+
+        metric_candidates = sorted(k for k in val_metrics if k.startswith("val-core/"))
+        if not metric_candidates:
+            if not self._warned_missing_best_metric:
+                print("No val-core metric found; skipping best checkpoint selection for this validation step.")
+                self._warned_missing_best_metric = True
+            return None
+
+        acc_candidates = [k for k in metric_candidates if "/acc/" in k]
+        if acc_candidates:
+            metric_candidates = acc_candidates
+
+        mean_candidates = [k for k in metric_candidates if "/mean@" in k]
+        if mean_candidates:
+            metric_candidates = mean_candidates
+
+        self.best_metric_key = metric_candidates[0]
+        self._warned_missing_best_metric = False
+        print(f"Auto-selected best checkpoint metric: {self.best_metric_key}")
+        return self.best_metric_key
+
+    def _maybe_save_best_checkpoint(self, val_metrics: dict[str, Any], timing_raw: Optional[dict] = None) -> None:
+        if not self.save_best_checkpoint:
+            return
+
+        metric_key = self._resolve_best_metric_key(val_metrics)
+        if metric_key is None:
+            return
+
+        metric_value = val_metrics.get(metric_key)
+        if metric_value is None:
+            return
+
+        current_metric = float(metric_value)
+        if not np.isfinite(current_metric):
+            print(
+                "Skipping best checkpoint update because validation metric is not finite: "
+                f"{metric_key}={current_metric}"
+            )
+            return
+
+        if self.best_val_metric is not None and current_metric <= self.best_val_metric:
+            return
+
+        self.best_val_metric = current_metric
+        print(
+            f"New best checkpoint metric at global_step {self.global_steps}: "
+            f"{metric_key}={current_metric}"
+        )
+        if timing_raw is None:
+            self._save_best_checkpoint()
+        else:
+            with marked_timer("save_best_checkpoint", timing_raw, color="green"):
+                self._save_best_checkpoint()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -995,6 +1116,49 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _save_best_checkpoint(self):
+        from verl.utils.fs import local_mkdir_safe
+
+        best_checkpoint_dir = self._get_best_checkpoint_dir()
+        actor_local_path = os.path.join(best_checkpoint_dir, "actor")
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, "best_checkpoint", "actor")
+        )
+
+        print(
+            "Saving best checkpoint to "
+            f"{best_checkpoint_dir} using metric {self.best_metric_key}={self.best_val_metric}"
+        )
+
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path,
+            actor_remote_path,
+            self.global_steps,
+            max_ckpt_to_keep=1,
+        )
+
+        if self.use_critic:
+            critic_local_path = os.path.join(best_checkpoint_dir, str(Role.Critic))
+            critic_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(self.config.trainer.default_hdfs_dir, "best_checkpoint", str(Role.Critic))
+            )
+            self.critic_wg.save_checkpoint(
+                critic_local_path,
+                critic_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=1,
+            )
+
+        local_mkdir_safe(best_checkpoint_dir)
+        with open(self._get_best_metric_info_path(), "w", encoding="utf-8") as f:
+            f.write(f"global_steps: {self.global_steps}\n")
+            f.write(f"metric_key: {self.best_metric_key}\n")
+            f.write(f"metric_value: {self.best_val_metric}\n")
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -1338,6 +1502,7 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            self._maybe_save_best_checkpoint(val_metrics)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1629,6 +1794,7 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    self._maybe_save_best_checkpoint(val_metrics, timing_raw=timing_raw)
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

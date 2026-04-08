@@ -132,6 +132,7 @@ off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacit
 # ================================ Training schedule ================================
 test_freq=10
 save_freq=-1
+save_best_checkpoint=True
 total_epochs=1
 total_training_steps=500
 val_before_train=False
@@ -238,6 +239,7 @@ python3 -m recipe.aapo.main_aapo \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train="${val_before_train}" \
     trainer.save_freq="${save_freq}" \
+    trainer.save_best_checkpoint="${save_best_checkpoint}" \
     trainer.test_freq="${test_freq}" \
     trainer.total_epochs="${total_epochs}" \
     trainer.total_training_steps="${total_training_steps}" \

@@ -773,6 +773,7 @@ class DataParallelPPOActor(BasePPOActor):
                         try:
                             self.config._temp_global_steps = data.meta_info.get("global_steps")
                             self.config._temp_response_ids = model_inputs.get("responses")
+                            self.config._temp_hear_reuse_epoch = bool(use_high_entropy_only)
                         except Exception:
                             pass
                         policy_loss_kwargs["entropy"] = entropy

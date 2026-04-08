@@ -29,7 +29,7 @@ export HYDRA_FULL_ERROR=1
 
 # ================================ Project configuration ================================
 project_name='off-policy-hear'
-exp_name='hear-ds1.5b-buffer-test'
+exp_name='hear-ds1.5b-ratio-0.2'
 
 # ================================ Paths ================================
 model_path='/home/cxy/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1___5B'
@@ -67,12 +67,12 @@ high_entropy_ratio=0.2
 high_entropy_last_epoch_enabled=True
 enable_correction=True
 correction_history_size=10
-correction_beta=1.5
-correction_lambda=1.0
+correction_beta=2.0
+correction_lambda=2.0
 
 enable_high_entropy_guard=True
 # Guard coverage is measured on the selected HEAR token subset, not on all response tokens.
-high_entropy_guard_min_ratio=0.9995
+high_entropy_guard_min_ratio=0.95
 high_entropy_guard_select_ratio=0.2
 high_entropy_guard_max_iters=25
 high_entropy_guard_low_step=0.01
@@ -169,7 +169,7 @@ actor_offload=False
 rollout_gpu_memory_utilization=0.8
 
 # ================================ Batch parameters ================================
-train_prompt_bsz=32
+train_prompt_bsz=64
 n_resp_per_prompt=8
 ppo_mini_batch_size=16
 ppo_micro_batch_size_per_gpu=4
@@ -180,8 +180,9 @@ ref_log_prob_micro_batch_size_per_gpu=4
 off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps))
 
 # ================================ Training schedule ================================
-test_freq=5
+test_freq=10
 save_freq=50
+save_best_checkpoint=True
 total_epochs=1
 total_training_steps=500
 val_before_train=False
@@ -307,6 +308,7 @@ python3 -m recipe.aapo.main_aapo \
     trainer.val_before_train="${val_before_train}" \
     trainer.validation_data_dir="${validation_data_dir}" \
     trainer.save_freq="${save_freq}" \
+    trainer.save_best_checkpoint="${save_best_checkpoint}" \
     trainer.test_freq="${test_freq}" \
     trainer.total_epochs="${total_epochs}" \
     trainer.total_training_steps="${total_training_steps}" \

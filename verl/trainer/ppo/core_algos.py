@@ -58,87 +58,51 @@ def get_hear_metrics(policy_loss_config: Any, metric_prefix: str = "actor/hear_"
     clip_info = _hear_metric_storage[config_id]
     metrics: dict[str, float] = {}
 
-    simple_metric_map = {
+    export_metric_map = {
         "clip_low": f"{metric_prefix}clip_low",
         "clip_high": f"{metric_prefix}clip_high",
-        "entropy_mean": f"{metric_prefix}entropy_mean",
-        "entropy_ema_mean": f"{metric_prefix}entropy_ema_mean",
-        "entropy_ema_std": f"{metric_prefix}entropy_ema_std",
-        "high_entropy_coverage": f"{metric_prefix}high_entropy_coverage",
+        "high_entropy_guard/coverage_before": f"{metric_prefix}high_entropy_guard/coverage_before",
+        "high_entropy_guard/coverage_after": f"{metric_prefix}high_entropy_guard/coverage_after",
+        "high_entropy_guard/iterations_used": f"{metric_prefix}high_entropy_guard/iterations_used",
+        "high_entropy_guard/clip_low_delta": f"{metric_prefix}high_entropy_guard/clip_low_delta",
+        "high_entropy_guard/clip_high_delta": f"{metric_prefix}high_entropy_guard/clip_high_delta",
+        "high_entropy_guard/covered_token_count_before": f"{metric_prefix}high_entropy_guard/covered_token_count_before",
+        "high_entropy_guard/uncovered_token_count_before": f"{metric_prefix}high_entropy_guard/uncovered_token_count_before",
+        "high_entropy_guard/covered_token_count_after": f"{metric_prefix}high_entropy_guard/covered_token_count_after",
+        "high_entropy_guard/uncovered_token_count_after": f"{metric_prefix}high_entropy_guard/uncovered_token_count_after",
+        "high_entropy_guard/covered_token_gain_count": f"{metric_prefix}high_entropy_guard/covered_token_gain_count",
+        "ratio/correction_count": f"{metric_prefix}ratio/correction_count",
+        "ratio/correction_mean_diff": f"{metric_prefix}ratio/correction_mean_diff",
+        "ratio/history_mean_log_ratio": f"{metric_prefix}ratio/history_mean_log_ratio",
     }
-    for source_key, target_key in simple_metric_map.items():
+    for source_key, target_key in export_metric_map.items():
         value = clip_info.get(source_key)
         if value is not None:
             metrics[target_key] = float(value)
 
-    for key, value in clip_info.items():
-        if value is None:
-            continue
-        if key.startswith(("high_entropy_guard/", "high_entropy/", "ratio/")):
-            metrics[f"{metric_prefix}{key}"] = float(value)
-
     return metrics
 
 
-def _get_default_hear_metric_storage(clip_low: float, clip_high: float) -> dict[str, float]:
-    """Build a stable HEAR metric dictionary so dashboards always see the same keys."""
+def _get_default_hear_metric_storage(clip_low: float, clip_high: float) -> dict[str, Any]:
+    """Build the minimal HEAR metric dictionary exported to dashboards."""
     clip_low = float(clip_low)
     clip_high = float(clip_high)
-    clip_range = clip_high - clip_low
     return {
         "clip_low": clip_low,
         "clip_high": clip_high,
-        "entropy_mean": 0.0,
-        "entropy_ema_mean": 0.0,
-        "entropy_ema_std": 0.0,
-        "high_entropy_coverage": 0.0,
-        "high_entropy/selected_ratio": 0.0,
-        "high_entropy/threshold": 0.0,
-        "high_entropy/entropy_selected_mean": 0.0,
-        "high_entropy/entropy_all_mean": 0.0,
-        "high_entropy/total_tokens": 0.0,
-        "high_entropy/selected_tokens": 0.0,
-        "high_entropy/coverage_after_guard": 0.0,
-        "high_entropy/coverage_after_clip": 0.0,
-        "high_entropy/coverage_gain_from_correction": 0.0,
-        "high_entropy_guard/coverage_before": 0.0,
-        "high_entropy_guard/coverage_after": 0.0,
-        "high_entropy_guard/clip_low_before": clip_low,
-        "high_entropy_guard/clip_high_before": clip_high,
-        "high_entropy_guard/clip_low_after": clip_low,
-        "high_entropy_guard/clip_high_after": clip_high,
-        "high_entropy_guard/clip_range_before": clip_range,
-        "high_entropy_guard/clip_range_after": clip_range,
-        "high_entropy_guard/iterations_used": 0.0,
-        "high_entropy_guard/target_ratio": 0.0,
-        "high_entropy_guard/clip_low_delta": 0.0,
-        "high_entropy_guard/clip_high_delta": 0.0,
-        "high_entropy_guard/coverage_delta": 0.0,
-        "high_entropy_guard/invoked_batch_count": 0.0,
-        "high_entropy_guard/needs_adjustment_batch_count": 0.0,
-        "high_entropy_guard/adjusted_batch_count": 0.0,
-        "high_entropy_guard/clip_low_delta_max": 0.0,
-        "high_entropy_guard/clip_high_delta_max": 0.0,
-        "high_entropy_guard/coverage_delta_max": 0.0,
-        "ratio/pos_adv_mean": 0.0,
-        "ratio/pos_adv_std": 0.0,
-        "ratio/pos_adv_max": 0.0,
-        "ratio/pos_adv_min": 0.0,
-        "ratio/pos_adv_exceed_high": 0.0,
-        "ratio/pos_adv_count": 0.0,
-        "ratio/neg_adv_mean": 0.0,
-        "ratio/neg_adv_std": 0.0,
-        "ratio/neg_adv_max": 0.0,
-        "ratio/neg_adv_min": 0.0,
-        "ratio/neg_adv_below_low": 0.0,
-        "ratio/neg_adv_count": 0.0,
+        "high_entropy_guard/coverage_before": None,
+        "high_entropy_guard/coverage_after": None,
+        "high_entropy_guard/iterations_used": None,
+        "high_entropy_guard/clip_low_delta": None,
+        "high_entropy_guard/clip_high_delta": None,
+        "high_entropy_guard/covered_token_count_before": None,
+        "high_entropy_guard/uncovered_token_count_before": None,
+        "high_entropy_guard/covered_token_count_after": None,
+        "high_entropy_guard/uncovered_token_count_after": None,
+        "high_entropy_guard/covered_token_gain_count": None,
         "ratio/correction_count": 0.0,
         "ratio/correction_mean_diff": 0.0,
-        "ratio/correction_trigger_count": 0.0,
-        "ratio/correction_success_count": 0.0,
-        "ratio/history_update_frequency": 0.0,
         "ratio/history_mean_log_ratio": 0.0,
-        "ratio/history_max_log_ratio": 0.0,
     }
 
 
@@ -350,26 +314,17 @@ def _select_high_entropy_tokens(
     token_entropy: torch.Tensor | None,
     response_mask: torch.Tensor,
     target_ratio: float,
-) -> tuple[torch.Tensor | None, dict[str, float]]:
+) -> torch.Tensor | None:
 
-    stats = {
-        "high_entropy/selected_ratio": 0.0,
-        "high_entropy/threshold": 0.0,
-        "high_entropy/entropy_selected_mean": 0.0,
-        "high_entropy/entropy_all_mean": 0.0,
-        "high_entropy/total_tokens": 0.0,
-        "high_entropy/selected_tokens": 0.0,
-    }
     if token_entropy is None:
-        return None, stats
+        return None
     valid_mask = response_mask > 0
     valid_token_count = valid_mask.sum()
-    stats["high_entropy/total_tokens"] = float(valid_token_count.item())
     if valid_token_count.item() == 0:
-        return None, stats
+        return None
     entropy_values = token_entropy[valid_mask]
     if entropy_values.numel() == 0:
-        return None, stats
+        return None
 
     ratio = float(np.clip(target_ratio, 0.0, 1.0))
     k = max(1, int(entropy_values.numel() * ratio))
@@ -377,15 +332,7 @@ def _select_high_entropy_tokens(
     topk_values = torch.topk(entropy_values, k).values
     threshold_value = topk_values[-1]
     high_entropy_mask = (token_entropy >= threshold_value) & valid_mask
-    selected_count = high_entropy_mask.sum()
-
-    if selected_count.item() > 0:
-        stats["high_entropy/selected_ratio"] = float(selected_count.item() / valid_token_count.item())
-        stats["high_entropy/threshold"] = float(threshold_value.item())
-        stats["high_entropy/entropy_selected_mean"] = float(token_entropy[high_entropy_mask].mean().item())
-    stats["high_entropy/entropy_all_mean"] = float(entropy_values.mean().item())
-    stats["high_entropy/selected_tokens"] = float(selected_count.item())
-    return high_entropy_mask, stats
+    return high_entropy_mask if torch.any(high_entropy_mask) else None
 
 
 def _compute_high_entropy_coverage(
@@ -421,64 +368,37 @@ def _adjust_clip_for_high_entropy_tokens(
     max_iters: int,
     low_step: float,
     high_step: float,
-) -> tuple[float, float, float | None, dict[str, float]]:
+) -> tuple[float, float, float | None, dict[str, float] | None]:
 
     stats = {
-
         "high_entropy_guard/coverage_before": 0.0,
         "high_entropy_guard/coverage_after": 0.0,
-        "high_entropy_guard/clip_low_before": ratio_low_cur,
-        "high_entropy_guard/clip_high_before": ratio_high_cur,
-        "high_entropy_guard/clip_low_after": ratio_low_cur,
-        "high_entropy_guard/clip_high_after": ratio_high_cur,
-        "high_entropy_guard/clip_range_before": ratio_high_cur - ratio_low_cur,
-        "high_entropy_guard/clip_range_after": ratio_high_cur - ratio_low_cur,
         "high_entropy_guard/iterations_used": 0.0,
-        "high_entropy_guard/target_ratio": target_ratio,
         "high_entropy_guard/clip_low_delta": 0.0,
         "high_entropy_guard/clip_high_delta": 0.0,
-        "high_entropy_guard/coverage_delta": 0.0,
-        "high_entropy_guard/invoked_batch_count": 0.0,
-        "high_entropy_guard/needs_adjustment_batch_count": 0.0,
-        "high_entropy_guard/adjusted_batch_count": 0.0,
-        "high_entropy_guard/clip_low_delta_max": 0.0,
-        "high_entropy_guard/clip_high_delta_max": 0.0,
-        "high_entropy_guard/coverage_delta_max": 0.0,
-
+        "high_entropy_guard/covered_token_count_before": 0.0,
+        "high_entropy_guard/uncovered_token_count_before": 0.0,
+        "high_entropy_guard/covered_token_count_after": 0.0,
+        "high_entropy_guard/uncovered_token_count_after": 0.0,
+        "high_entropy_guard/covered_token_gain_count": 0.0,
     }
 
     ratio_low_initial = ratio_low_cur
     ratio_high_initial = ratio_high_cur
 
     if high_entropy_mask is None or target_ratio <= 0.0:
-        # 设置 delta 指标（即使没有变化也要记录）
-        stats["high_entropy_guard/clip_low_delta"] = 0.0
-        stats["high_entropy_guard/clip_high_delta"] = 0.0
-        stats["high_entropy_guard/coverage_delta"] = 0.0
-        return ratio_low_cur, ratio_high_cur, None, stats
+        return ratio_low_cur, ratio_high_cur, None, None
 
     valid_mask = response_mask > 0
     total_valid = valid_mask.sum()
     if total_valid.item() == 0:
-        # 设置 delta 指标（即使没有变化也要记录）
-        stats["high_entropy_guard/clip_low_delta"] = 0.0
-
-        stats["high_entropy_guard/clip_high_delta"] = 0.0
-        stats["high_entropy_guard/coverage_delta"] = 0.0
-        return ratio_low_cur, ratio_high_cur, None, stats
+        return ratio_low_cur, ratio_high_cur, None, None
 
     high_entropy_mask = high_entropy_mask & valid_mask
     high_entropy_count = high_entropy_mask.sum()
     if high_entropy_count.item() == 0:
-        stats["high_entropy_guard/coverage_before"] = 0.0
-        stats["high_entropy_guard/coverage_after"] = 0.0
-        # 设置 delta 指标（即使没有变化也要记录）
-        stats["high_entropy_guard/clip_low_delta"] = 0.0
-        stats["high_entropy_guard/clip_high_delta"] = 0.0
-        stats["high_entropy_guard/coverage_delta"] = 0.0
-        return ratio_low_cur, ratio_high_cur, 0.0, stats
+        return ratio_low_cur, ratio_high_cur, None, None
 
-    stats["high_entropy_guard/invoked_batch_count"] = 1.0
     coverage_before = _compute_high_entropy_coverage(
         ratio=corrected_ratio,
         response_mask=response_mask,
@@ -487,23 +407,23 @@ def _adjust_clip_for_high_entropy_tokens(
         high_bound=ratio_high_cur,
     )
     assert coverage_before is not None
+    covered_before_count = int(
+        (((corrected_ratio >= ratio_low_cur) & (corrected_ratio <= ratio_high_cur) & high_entropy_mask).sum().item())
+    )
+    total_selected_count = int(high_entropy_count.item())
+    uncovered_before_count = max(total_selected_count - covered_before_count, 0)
     stats["high_entropy_guard/coverage_before"] = float(coverage_before)
-    stats["high_entropy_guard/clip_low_before"] = float(ratio_low_cur)
-    stats["high_entropy_guard/clip_high_before"] = float(ratio_high_cur)
-    stats["high_entropy_guard/clip_range_before"] = float(ratio_high_cur - ratio_low_cur)
+    stats["high_entropy_guard/covered_token_count_before"] = float(covered_before_count)
+    stats["high_entropy_guard/uncovered_token_count_before"] = float(uncovered_before_count)
     if coverage_before >= target_ratio:
         stats["high_entropy_guard/coverage_after"] = float(coverage_before)
-        stats["high_entropy_guard/clip_low_after"] = float(ratio_low_cur)
-        stats["high_entropy_guard/clip_high_after"] = float(ratio_high_cur)
-        stats["high_entropy_guard/clip_range_after"] = float(ratio_high_cur - ratio_low_cur)
-        # 设置 delta 指标（即使没有变化也要记录）
-
         stats["high_entropy_guard/clip_low_delta"] = float(ratio_low_cur - ratio_low_initial)
         stats["high_entropy_guard/clip_high_delta"] = float(ratio_high_cur - ratio_high_initial)
-        stats["high_entropy_guard/coverage_delta"] = 0.0  # coverage 没有变化
+        stats["high_entropy_guard/covered_token_count_after"] = float(covered_before_count)
+        stats["high_entropy_guard/uncovered_token_count_after"] = float(uncovered_before_count)
+        stats["high_entropy_guard/covered_token_gain_count"] = 0.0
         return ratio_low_cur, ratio_high_cur, float(coverage_before), stats
 
-    stats["high_entropy_guard/needs_adjustment_batch_count"] = 1.0
     low_step = float(max(low_step, 0.0))
     high_step = float(max(high_step, 0.0))
     ratio_low_min = float(min(ratio_low_min, ratio_low_cur))
@@ -541,17 +461,16 @@ def _adjust_clip_for_high_entropy_tokens(
             break
 
     stats["high_entropy_guard/coverage_after"] = float(achieved)
-    stats["high_entropy_guard/clip_low_after"] = float(ratio_low_cur)
-    stats["high_entropy_guard/clip_high_after"] = float(ratio_high_cur)
-    stats["high_entropy_guard/clip_range_after"] = float(ratio_high_cur - ratio_low_cur)
     stats["high_entropy_guard/iterations_used"] = float(iterations_used)
     stats["high_entropy_guard/clip_low_delta"] = float(ratio_low_cur - ratio_low_initial)
     stats["high_entropy_guard/clip_high_delta"] = float(ratio_high_cur - ratio_high_initial)
-    stats["high_entropy_guard/coverage_delta"] = float(achieved - coverage_before)
-    stats["high_entropy_guard/adjusted_batch_count"] = 1.0 if iterations_used > 0 else 0.0
-    stats["high_entropy_guard/clip_low_delta_max"] = abs(float(ratio_low_cur - ratio_low_initial))
-    stats["high_entropy_guard/clip_high_delta_max"] = abs(float(ratio_high_cur - ratio_high_initial))
-    stats["high_entropy_guard/coverage_delta_max"] = abs(float(achieved - coverage_before))
+    covered_after_count = int(
+        (((corrected_ratio >= ratio_low_cur) & (corrected_ratio <= ratio_high_cur) & high_entropy_mask).sum().item())
+    )
+    uncovered_after_count = max(total_selected_count - covered_after_count, 0)
+    stats["high_entropy_guard/covered_token_count_after"] = float(covered_after_count)
+    stats["high_entropy_guard/uncovered_token_count_after"] = float(uncovered_after_count)
+    stats["high_entropy_guard/covered_token_gain_count"] = float(covered_after_count - covered_before_count)
     return ratio_low_cur, ratio_high_cur, float(achieved), stats
 PolicyLossFn = Callable[
     [
@@ -2011,6 +1930,7 @@ def compute_policy_loss_hear(
     high_entropy_high_max = default_high * 2.0
     guard_lower_min = None
     guard_upper_max = None
+    reuse_epoch = bool(getattr(config, "_temp_hear_reuse_epoch", False))
     if pl_config is not None:
         # 高熵守卫参数
         high_entropy_guard_enabled = bool(getattr(pl_config, "enable_high_entropy_guard", False))
@@ -2065,11 +1985,14 @@ def compute_policy_loss_hear(
         if high_entropy_selection_ratio is not None
         else float(max(1e-6, min(1.0, 1.0 - float(high_entropy_quantile))))
     )
-    high_entropy_mask, high_entropy_stats = _select_high_entropy_tokens(
-        token_entropy=entropy,
-        response_mask=response_mask,
-        target_ratio=selection_ratio,
-    )
+    if reuse_epoch:
+        high_entropy_mask = (response_mask > 0) if torch.any(response_mask > 0) else None
+    else:
+        high_entropy_mask = _select_high_entropy_tokens(
+            token_entropy=entropy,
+            response_mask=response_mask,
+            target_ratio=selection_ratio,
+        )
     if high_entropy_guard_enabled and high_entropy_target_ratio > 0.0:
         ratio_low_cur, ratio_high_cur, high_entropy_coverage, high_entropy_guard_stats = _adjust_clip_for_high_entropy_tokens(
             corrected_ratio=corrected_ratio,
@@ -2096,14 +2019,6 @@ def compute_policy_loss_hear(
             low_bound=final_clip_low,
             high_bound=final_clip_high,
         )
-        if high_entropy_stats is not None and high_entropy_coverage is not None:
-            high_entropy_stats["high_entropy/coverage_after_clip"] = float(high_entropy_coverage)
-            if high_entropy_guard_stats is not None:
-                guard_coverage_after = float(high_entropy_guard_stats["high_entropy_guard/coverage_after"])
-                high_entropy_stats["high_entropy/coverage_after_guard"] = guard_coverage_after
-                high_entropy_stats["high_entropy/coverage_gain_from_correction"] = float(
-                    high_entropy_coverage - guard_coverage_after
-                )
 
     pg_losses1 = -advantages * corrected_ratio
     pg_losses2 = -advantages * torch.clamp(corrected_ratio, final_clip_low, final_clip_high)
@@ -2135,90 +2050,47 @@ def compute_policy_loss_hear(
         storage_dict = _get_default_hear_metric_storage(default_low, default_high)
         storage_dict["clip_low"] = float(final_clip_low)
         storage_dict["clip_high"] = float(final_clip_high)
-        storage_dict["high_entropy_guard/target_ratio"] = float(high_entropy_target_ratio)
-
-        # 动态裁剪指标
-
-        # 高熵相关指标
-        if high_entropy_coverage is not None:
-            storage_dict["high_entropy_coverage"] = float(high_entropy_coverage)
-        if high_entropy_stats is not None:
-            for key, value in high_entropy_stats.items():
-                storage_dict[key] = float(value)
         if high_entropy_guard_stats is not None:
             for key, value in high_entropy_guard_stats.items():
                 storage_dict[key] = float(value)
 
-        # 熵相关指标
-        if entropy_mean_value is not None:
-            storage_dict["entropy_mean"] = entropy_mean_value
-            device_id = str(log_prob.device)
-            if device_id in _hear_entropy_ema_state:
-                ema_state = _hear_entropy_ema_state[device_id]
-                storage_dict["entropy_ema_mean"] = ema_state["mean"]
-                storage_dict["entropy_ema_std"] = ema_state["std"]
-
         with torch.no_grad():
-            valid_mask = response_mask > 0
-            positive_mask = (advantages > 0) & valid_mask
-            negative_mask = (advantages < 0) & valid_mask
-            _update_hear_ratio_bucket_metrics(
-                storage_dict=storage_dict,
-                bucket_name="pos_adv",
-                ratio=token_importance_ratio,
-                bucket_mask=positive_mask,
-                clip_low=default_low,
-                clip_high=default_high,
-            )
-            _update_hear_ratio_bucket_metrics(
-                storage_dict=storage_dict,
-                bucket_name="neg_adv",
-                ratio=token_importance_ratio,
-                bucket_mask=negative_mask,
-                clip_low=default_low,
-                clip_high=default_high,
-            )
             if enable_correction:
+                positive_mask = (advantages > 0) & (response_mask > 0)
                 log_default_clip_high = float(np.log(max(default_high, 1e-8)))
                 trigger_threshold = max(history_anchor, log_default_clip_high) if history_anchor is not None else None
                 if trigger_threshold is not None:
                     correction_trigger_mask = positive_mask & (negative_approx_kl > trigger_threshold)
                     correction_delta = (corrected_ratio - token_importance_ratio).abs()
                     correction_mask = correction_trigger_mask & (correction_delta > 1e-6)
-                    correction_success_mask = correction_trigger_mask & (corrected_ratio <= default_high)
                     storage_dict["ratio/correction_count"] = float(correction_mask.sum().item())
                     if torch.any(correction_mask):
                         storage_dict["ratio/correction_mean_diff"] = float(correction_delta[correction_mask].mean().item())
-                    storage_dict["ratio/correction_trigger_count"] = float(correction_trigger_mask.sum().item())
-                    storage_dict["ratio/correction_success_count"] = float(correction_success_mask.sum().item())
 
         _hear_metric_storage[config_id] = storage_dict
 
     # ============ 更新历史队列 ============
     if enable_correction and history_queue is not None:
         with torch.no_grad():
-            positive_mask = (advantages > 0) & (response_mask > 0)
-            log_default_clip_high = float(np.log(max(default_high, 1e-8)))
-            not_clipped_mask = negative_approx_kl <= log_default_clip_high
-            healthy_mask = positive_mask & not_clipped_mask
-            if torch.any(healthy_mask):
-                healthy_log_ratios = negative_approx_kl[healthy_mask]
-                healthy_log_ratio_mean = healthy_log_ratios.mean().item()
-                healthy_log_ratio_std = healthy_log_ratios.std(unbiased=False).item()
-                healthy_count = int(healthy_mask.sum().item())
-                healthy_log_ratio_max = healthy_log_ratios.max().item()
-                history_queue.append((healthy_log_ratio_mean, healthy_log_ratio_std, healthy_count, healthy_log_ratio_max))
-                history_update_frequency = 1.0
+            if not reuse_epoch:
+                positive_mask = (advantages > 0) & (response_mask > 0)
+                log_default_clip_high = float(np.log(max(default_high, 1e-8)))
+                not_clipped_mask = negative_approx_kl <= log_default_clip_high
+                healthy_mask = positive_mask & not_clipped_mask
+                if torch.any(healthy_mask):
+                    healthy_log_ratios = negative_approx_kl[healthy_mask]
+                    healthy_log_ratio_mean = healthy_log_ratios.mean().item()
+                    healthy_log_ratio_std = healthy_log_ratios.std(unbiased=False).item()
+                    healthy_count = int(healthy_mask.sum().item())
+                    healthy_log_ratio_max = healthy_log_ratios.max().item()
+                    history_queue.append((healthy_log_ratio_mean, healthy_log_ratio_std, healthy_count, healthy_log_ratio_max))
+                    history_update_frequency = 1.0
 
             history_queue_mean_log_ratio, history_queue_max_log_ratio, _ = _summarize_log_ratio_history(history_queue)
 
     if pl_config is not None and enable_correction:
-        storage_dict["ratio/history_update_frequency"] = float(history_update_frequency)
         storage_dict["ratio/history_mean_log_ratio"] = (
             float(history_queue_mean_log_ratio) if history_queue_mean_log_ratio is not None else 0.0
-        )
-        storage_dict["ratio/history_max_log_ratio"] = (
-            float(history_queue_max_log_ratio) if history_queue_max_log_ratio is not None else 0.0
         )
         _hear_metric_storage[config_id] = storage_dict
 
