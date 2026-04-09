@@ -733,7 +733,7 @@ class DataParallelPPOActor(BasePPOActor):
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
                     else:
-                        if on_policy:
+                        if on_policy and loss_mode != "hear":
                             old_log_prob = log_prob.detach()
                         else:
                             old_log_prob = model_inputs["old_log_probs"]

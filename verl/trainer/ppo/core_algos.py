@@ -1960,22 +1960,12 @@ def compute_policy_loss_hear(
     history_queue_mean_log_ratio = None
     history_queue_max_log_ratio = None
 
-    # Stage 2: apply history correction against the default PPO upper bound.
     if enable_correction:
         device_id = str(log_prob.device)
         history_queue = get_ratio_history(device_id, max_size=correction_history_size)
         history_anchor, _, _, _ = _compute_weighted_log_ratio_anchor(history_queue, beta=correction_beta)
-        corrected_ratio = adaptive_ratio_correction_token(
-            token_log_ratio=negative_approx_kl,
-            advantages=advantages,
-            response_mask=response_mask,
-            history_queue=history_queue,
-            clip_high=default_high,
-            beta=correction_beta,
-            correction_lambda=correction_lambda,
-        )
 
-    # Stage 3: select high-entropy tokens and run the guard on corrected_ratio.
+    # Stage 2: select high-entropy tokens and run the guard on the raw ratio.
     ratio_low_cur = default_low
     ratio_high_cur = default_high
     high_entropy_coverage = None
@@ -1995,7 +1985,7 @@ def compute_policy_loss_hear(
         )
     if high_entropy_guard_enabled and high_entropy_target_ratio > 0.0:
         ratio_low_cur, ratio_high_cur, high_entropy_coverage, high_entropy_guard_stats = _adjust_clip_for_high_entropy_tokens(
-            corrected_ratio=corrected_ratio,
+            corrected_ratio=token_importance_ratio,
             response_mask=response_mask,
             high_entropy_mask=high_entropy_mask,
             ratio_low_cur=ratio_low_cur,
@@ -2009,6 +1999,19 @@ def compute_policy_loss_hear(
         )
     final_clip_low = ratio_low_cur
     final_clip_high = ratio_high_cur
+
+    # Stage 3: apply history correction after dynamic clipping, but keep the
+    # correction trigger anchored to the default PPO upper bound.
+    if enable_correction:
+        corrected_ratio = adaptive_ratio_correction_token(
+            token_log_ratio=negative_approx_kl,
+            advantages=advantages,
+            response_mask=response_mask,
+            history_queue=history_queue,
+            clip_high=default_high,
+            beta=correction_beta,
+            correction_lambda=correction_lambda,
+        )
 
     # Compute the HEAR loss with decoupled clip bounds and dual-clip fallback.
     if high_entropy_mask is not None:

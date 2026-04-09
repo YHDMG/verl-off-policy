@@ -34,7 +34,7 @@ exp_name='hear-ds1.5b-ratio-0.2'
 # ================================ Paths ================================
 model_path='/home/cxy/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1___5B'
 train_file='/home/cxy/verl_async/dapodataset/train-00000-of-00001_converted_final.parquet'
-test_file='/home/cxy/verl_async/DeepscalerDataset/converted/aime2025_converted_verl_fixed.parquet'
+test_file=["/home/cxy/verl_async/DeepscalerDataset/converted/aime2025_converted_verl_fixed.parquet","/home/cxy/verl_async/DeepscalerDataset/AIM24/train_converted_verl_format.parquet"]
 ckpts_dir="/mnt/data1/ckpts/${project_name}/${exp_name}"
 
 # ================================ Resume configuration ================================
@@ -64,15 +64,15 @@ clip_ratio_high=0.28
 
 # ================================ HEAR parameters ================================
 high_entropy_ratio=0.2
-high_entropy_last_epoch_enabled=True
+high_entropy_last_epoch_enabled=False
 enable_correction=True
 correction_history_size=10
-correction_beta=2.0
-correction_lambda=2.0
+correction_beta=6.0
+correction_lambda=6.0
 
 enable_high_entropy_guard=True
 # Guard coverage is measured on the selected HEAR token subset, not on all response tokens.
-high_entropy_guard_min_ratio=0.95
+high_entropy_guard_min_ratio=0.999
 high_entropy_guard_select_ratio=0.2
 high_entropy_guard_max_iters=25
 high_entropy_guard_low_step=0.01
@@ -96,10 +96,10 @@ off_policy_replay_end_ratio=0.25
 off_policy_replay_anneal_steps=0
 off_policy_warmup_steps=4
 off_policy_quality_alpha=0.5
-off_policy_late_quality_alpha_multiplier=1.0
+off_policy_late_quality_alpha_multiplier=2.0
 off_policy_staleness_horizon=4
 off_policy_uniform_mix=0.3
-off_policy_late_uniform_mix=0.3
+off_policy_late_uniform_mix=0.05
 off_policy_max_age_steps=4
 off_policy_zero_adv_epsilon=1e-6
 off_policy_cpu_offload=True
@@ -173,14 +173,14 @@ train_prompt_bsz=64
 n_resp_per_prompt=8
 ppo_mini_batch_size=16
 ppo_micro_batch_size_per_gpu=4
-ppo_epochs=2
+ppo_epochs=1
 rollout_log_prob_micro_batch_size_per_gpu=4
 ref_log_prob_micro_batch_size_per_gpu=4
 
 off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps))
 
 # ================================ Training schedule ================================
-test_freq=10
+test_freq=5
 save_freq=50
 save_best_checkpoint=True
 total_epochs=1
@@ -313,7 +313,7 @@ python3 -m recipe.aapo.main_aapo \
     trainer.total_epochs="${total_epochs}" \
     trainer.total_training_steps="${total_training_steps}" \
     trainer.default_local_dir="${ckpts_dir}" \
-    trainer.resume_mode="${resume_mode}" \
+    trainer.resume_mode="${resume_mode}"   \
     ${resume_from_path:+trainer.resume_from_path="${resume_from_path}"} \
     trainer.nnodes="${nnodes}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \

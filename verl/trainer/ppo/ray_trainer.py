@@ -512,11 +512,23 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        response_token_ids=None,
+        response_tokens=None,
+        response_token_entropies=None,
+    ):
         """Dump rollout/validation samples as JSONL and plain-text responses."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
         response_filename = os.path.join(dump_path, f"{self.global_steps}.responses.txt")
+        entropy_filename = os.path.join(dump_path, f"{self.global_steps}.token_entropies.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -548,6 +560,50 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
         print(f"Dumped response texts to {response_filename}")
+
+        if (
+            response_token_ids is not None
+            and response_tokens is not None
+            and response_token_entropies is not None
+            and len(response_token_ids) == n
+            and len(response_tokens) == n
+            and len(response_token_entropies) == n
+        ):
+            entropy_lines = []
+            for i in range(n):
+                entropy_entry = {
+                    "sample_idx": i,
+                    "step": self.global_steps,
+                    "output": outputs[i],
+                    "response_token_ids": response_token_ids[i],
+                    "response_tokens": response_tokens[i],
+                    "response_token_entropies": response_token_entropies[i],
+                }
+                entropy_lines.append(json.dumps(entropy_entry, ensure_ascii=False))
+            with open(entropy_filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(entropy_lines) + "\n")
+            print(f"Dumped token entropies to {entropy_filename}")
+
+    def _collect_response_token_entropy_dump_data(
+        self, batch: DataProto
+    ) -> tuple[list[list[int]], list[list[str]], list[list[float]]]:
+        entropy_batch, _ = self._compute_old_log_prob(batch)
+        entropys = entropy_batch.batch["entropys"]
+        response_ids = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"]
+
+        response_token_ids = []
+        response_tokens = []
+        response_token_entropies = []
+        for ids, mask, entropy in zip(response_ids, response_mask, entropys):
+            valid_len = int(mask.sum().item())
+            valid_ids = ids[:valid_len].detach().cpu().tolist()
+            valid_entropies = entropy[:valid_len].detach().cpu().tolist()
+            response_token_ids.append(valid_ids)
+            response_tokens.append(self.tokenizer.convert_ids_to_tokens(valid_ids))
+            response_token_entropies.append([float(x) for x in valid_entropies])
+
+        return response_token_ids, response_tokens, response_token_entropies
 
     def _dump_validation_question_accuracy(
         self,
@@ -697,6 +753,9 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_response_token_ids = []
+        sample_response_tokens = []
+        sample_response_token_entropies = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -755,6 +814,13 @@ class RayPPOTrainer:
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
+            val_data_dir = self.config.trainer.get("validation_data_dir", None)
+            if val_data_dir:
+                token_ids, tokens, token_entropies = self._collect_response_token_entropy_dump_data(test_batch)
+                sample_response_token_ids.extend(token_ids)
+                sample_response_tokens.extend(tokens)
+                sample_response_token_entropies.extend(token_entropies)
+
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
             # TODO: Can we keep special tokens except for padding tokens?
@@ -796,6 +862,9 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                response_token_ids=sample_response_token_ids,
+                response_tokens=sample_response_tokens,
+                response_token_entropies=sample_response_token_entropies,
             )
             self._dump_validation_question_accuracy(
                 inputs=sample_inputs,
