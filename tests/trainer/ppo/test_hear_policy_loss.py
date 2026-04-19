@@ -15,11 +15,13 @@ def clear_hear_state():
     core._hear_metric_storage.clear()
     core._hear_entropy_history.clear()
     core._hear_entropy_ema_state.clear()
+    core._hear_entropy_control_state.clear()
     yield
     core._hear_ratio_history.clear()
     core._hear_metric_storage.clear()
     core._hear_entropy_history.clear()
     core._hear_entropy_ema_state.clear()
+    core._hear_entropy_control_state.clear()
 
 
 def _make_actor_config(**policy_loss_overrides) -> ActorConfig:
@@ -201,3 +203,41 @@ def test_high_entropy_last_epoch_requires_explicit_enablement():
 
     assert enabled_actor._should_use_high_entropy_last_epoch(epoch_idx=0) is False
     assert enabled_actor._should_use_high_entropy_last_epoch(epoch_idx=1) is True
+
+
+def test_hear_guard_keeps_global_ratio_constant_during_reuse_epoch():
+    config = _make_actor_config(
+        enable_correction=False,
+        enable_high_entropy_guard=True,
+        high_entropy_guard_min_ratio=1.0,
+        high_entropy_guard_select_ratio=0.25,
+        high_entropy_guard_max_iters=0,
+    )
+    config._temp_hear_reuse_epoch = True
+    config._temp_hear_reuse_ratio = 0.5
+
+    ratio = torch.ones((1, 4), dtype=torch.float32)
+    old_log_prob = torch.zeros_like(ratio)
+    log_prob = torch.log(ratio)
+    advantages = torch.ones_like(ratio)
+    response_mask = torch.ones_like(ratio)
+    entropy = torch.tensor([[0.9, 0.8, 0.7, 0.6]], dtype=torch.float32)
+
+    compute_policy_loss_hear(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+        entropy=entropy,
+    )
+
+    hear_metrics = get_hear_metrics(config.policy_loss)
+    selected_guard_tokens = (
+        hear_metrics["actor/hear_high_entropy_guard/covered_token_count_before"]
+        + hear_metrics["actor/hear_high_entropy_guard/uncovered_token_count_before"]
+    )
+
+    # Reuse epoch only sees half of the original tokens; with a global guard ratio of 0.25,
+    # the guard budget should therefore cover 0.25 / 0.5 = 0.5 of the reused subset => 2 tokens.
+    assert selected_guard_tokens == pytest.approx(2.0)

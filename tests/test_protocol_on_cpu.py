@@ -336,6 +336,32 @@ def test_concat_merge_different_non_metric_keys():
     assert concat_data.meta_info["shared_key"] == "X"
 
 
+def test_concat_merges_reward_extra_keys_and_fills_missing_non_tensor_values():
+    obs1 = torch.tensor([1, 2])
+    obs2 = torch.tensor([3])
+
+    data1 = DataProto.from_dict(
+        tensors={"obs": obs1},
+        non_tensors={
+            "acc": np.array([1.0, 0.0]),
+            "error_type": np.array(["compile_error", None], dtype=object),
+        },
+        meta_info={"reward_extra_keys": ["acc", "error_type"]},
+    )
+    data2 = DataProto.from_dict(
+        tensors={"obs": obs2},
+        non_tensors={"acc": np.array([1.0])},
+        meta_info={"reward_extra_keys": ["acc"]},
+    )
+
+    concat_data = DataProto.concat([data1, data2])
+
+    assert torch.all(torch.eq(concat_data.batch["obs"], torch.tensor([1, 2, 3])))
+    assert concat_data.meta_info["reward_extra_keys"] == ["acc", "error_type"]
+    assert concat_data.non_tensor_batch["acc"].tolist() == [1.0, 0.0, 1.0]
+    assert concat_data.non_tensor_batch["error_type"].tolist() == ["compile_error", None, None]
+
+
 def test_concat_conflicting_non_metric_keys():
     """Test that concat() raises an assertion error when non-metric keys have conflicting values.
 

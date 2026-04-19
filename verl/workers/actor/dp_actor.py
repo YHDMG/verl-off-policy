@@ -774,6 +774,14 @@ class DataParallelPPOActor(BasePPOActor):
                             self.config._temp_global_steps = data.meta_info.get("global_steps")
                             self.config._temp_response_ids = model_inputs.get("responses")
                             self.config._temp_hear_reuse_epoch = bool(use_high_entropy_only)
+                            if use_high_entropy_only:
+                                total_valid_tokens = float(original_response_mask.sum().item())
+                                reused_valid_tokens = float(response_mask.sum().item())
+                                self.config._temp_hear_reuse_ratio = (
+                                    reused_valid_tokens / total_valid_tokens if total_valid_tokens > 0 else 0.0
+                                )
+                            else:
+                                self.config._temp_hear_reuse_ratio = None
                         except Exception:
                             pass
                         policy_loss_kwargs["entropy"] = entropy

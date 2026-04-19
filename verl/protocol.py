@@ -36,7 +36,7 @@ from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
 from verl.utils.device import get_device_id, get_torch_device
-from verl.utils.py_functional import append_to_dict, list_of_dict_to_dict_of_list, union_two_dict
+from verl.utils.py_functional import append_to_dict, list_of_dict_to_dict_of_list, ordered_union, union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
 
 __all__ = ["DataProto", "union_tensor_dict"]
@@ -928,9 +928,18 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
-        for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+        non_tensor_batch = {}
+        non_tensor_keys = ordered_union(d.non_tensor_batch.keys() for d in data)
+        for key in non_tensor_keys:
+            values = []
+            for d in data:
+                if key in d.non_tensor_batch:
+                    values.append(d.non_tensor_batch[key])
+                else:
+                    filler = np.empty((len(d),), dtype=object)
+                    filler[:] = None
+                    values.append(filler)
+            non_tensor_batch[key] = np.concatenate(values, axis=0)
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
@@ -945,6 +954,9 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        existing = merged_meta_info.get(k, [])
+                        merged_meta_info[k] = ordered_union([existing, v])
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys

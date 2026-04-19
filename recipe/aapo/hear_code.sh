@@ -3,7 +3,7 @@
 set -xeuo pipefail
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export OMP_NUM_THREADS=1
-
+export CODER1_EXEC=firejail
 export RAY_NAMESPACE=verl
 export RAY_worker_register_timeout_seconds=120
 export RAY_health_check_timeout_ms=60000
@@ -28,13 +28,13 @@ export HYDRA_FULL_ERROR=1
 
 
 # ================================ Project configuration ================================
-project_name='off-policy-hear'
-exp_name='hear-ds1.5b-ratio-0.4'
+project_name='off-policy-code-hear'
+exp_name='hear-qwencode7b-ratio-1.0'
 
 # ================================ Paths ================================
-model_path='/home/cxy/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1___5B'
-train_file='/home/cxy/verl_async/dapodataset/train-00000-of-00001_converted_final.parquet'
-test_file=["/home/cxy/verl_async/DeepscalerDataset/converted/aime2025_converted_verl_fixed.parquet","/home/cxy/verl_async/DeepscalerDataset/AIM24/train_converted_verl_format.parquet"]
+model_path='/home/cxy/.cache/modelscope/hub/models/Qwen/Qwen2___5-Coder-7B'
+train_file='["/home/cxy/verl_async/CodeDataset/code-r1-15k-taco/train.parquet","/home/cxy/verl_async/CodeDataset/code-r1-15k-taco/test.parquet"]'
+test_file='/home/cxy/verl_async/CodeDataset/livecodebench_filtered_2024-10_to_2025-05.parquet'
 ckpts_dir="/mnt/data1/ckpts/${project_name}/${exp_name}"
 
 # ================================ Resume configuration ================================
@@ -63,7 +63,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # ================================ HEAR parameters ================================
-high_entropy_ratio=0.2
+high_entropy_ratio=1.0
 high_entropy_last_epoch_enabled=True
 enable_correction=True
 correction_history_size=10
@@ -129,30 +129,31 @@ top_k=-1
 val_temperature=0.6
 val_top_p=0.7
 val_top_k=-1
+val_batch_size=16
 
 # ================================ Performance related parameters ================================
 use_dynamic_bsz=False
 ref_offload=True
 actor_offload=False
-rollout_gpu_memory_utilization=0.8
+rollout_gpu_memory_utilization=0.6
 
 # ================================ Batch parameters ================================
-train_prompt_bsz=64
+train_prompt_bsz=16
 n_resp_per_prompt=8
-ppo_mini_batch_size=16
-ppo_micro_batch_size_per_gpu=4
+ppo_mini_batch_size=8
+ppo_micro_batch_size_per_gpu=2
 ppo_epochs=2
-rollout_log_prob_micro_batch_size_per_gpu=4
-ref_log_prob_micro_batch_size_per_gpu=4
+rollout_log_prob_micro_batch_size_per_gpu=2
+ref_log_prob_micro_batch_size_per_gpu=2
 
 off_policy_capacity=$((train_prompt_bsz * n_resp_per_prompt * off_policy_capacity_steps))
 
 # ================================ Training schedule ================================
-test_freq=5
-save_freq=50
+test_freq=10
+save_freq=100
 save_best_checkpoint=True
 total_epochs=2
-total_training_steps=500
+total_training_steps=1000
 val_before_train=False
 
 # ================================ Misc ================================
@@ -177,6 +178,7 @@ python3 -m recipe.aapo.main_aapo \
     data.max_prompt_length="${max_prompt_length}" \
     data.max_response_length="${max_response_length}" \
     data.train_batch_size="${train_prompt_bsz}" \
+    data.val_batch_size="${val_batch_size}" \
     actor_rollout_ref.rollout.n="${n_resp_per_prompt}" \
     algorithm.use_kl_in_reward="${use_kl_in_reward}" \
     algorithm.kl_ctrl.kl_coef="${kl_coef}" \
@@ -247,6 +249,7 @@ python3 -m recipe.aapo.main_aapo \
     actor_rollout_ref.actor.fsdp_config.offload_policy=False \
     actor_rollout_ref.actor.fsdp_config.fsdp_size="${fsdp_size}" \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size="${sp_size}" \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=3072 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.gpu_memory_utilization="${rollout_gpu_memory_utilization}" \

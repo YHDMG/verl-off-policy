@@ -366,3 +366,15 @@ def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
             assert key in output, f"Key '{key}' is not present in the keys of the first dictionary in the list."
             output[key].append(item)
     return output
+
+
+def ordered_union(iterables):
+    """Return a stable union while preserving the first-seen order."""
+    output = []
+    seen = set()
+    for iterable in iterables:
+        for item in iterable:
+            if item not in seen:
+                seen.add(item)
+                output.append(item)
+    return output

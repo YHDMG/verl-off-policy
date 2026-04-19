@@ -248,6 +248,43 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     assert merged.non_tensor_batch["tool_rewards"][0] == []
 
 
+def test_agent_loop_postprocess_unions_reward_extra_info_keys_on_cpu():
+    internal_a = _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[11, 12],
+        output_response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={"reward_extra_info": {"acc": 1.0, "error_type": "compile_error"}},
+        num_turns=2,
+        prompt_len=4,
+        response_len=4,
+    )
+    internal_b = _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[21, 22],
+        output_response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={"reward_extra_info": {"acc": 0.0}},
+        num_turns=2,
+        prompt_len=4,
+        response_len=4,
+    )
+
+    dummy_worker = type("_DummyWorker", (), {"reward_loop_worker_handles": None})()
+    merged = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[internal_a, internal_b],
+        input_non_tensor_batch={
+            "index": np.array([0, 1], dtype=object),
+            "agent_name": np.array(["single_turn_agent", "single_turn_agent"], dtype=object),
+        },
+    )
+
+    assert merged.meta_info["reward_extra_keys"] == ["acc", "error_type"]
+    assert merged.non_tensor_batch["acc"].tolist() == [1.0, 0.0]
+    assert merged.non_tensor_batch["error_type"].tolist() == ["compile_error", None]
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     class _DummyWorker:

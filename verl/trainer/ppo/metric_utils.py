@@ -18,6 +18,7 @@ Metrics related to the PPO trainer.
 from collections import defaultdict
 from functools import partial
 import math
+import numbers
 from typing import Any, Callable
 
 import numpy as np
@@ -26,6 +27,17 @@ import torch
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+
+def _is_numeric_metric_value(value: Any) -> bool:
+    """Return True when a validation metric value can be safely reduced numerically."""
+    if value is None:
+        return False
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (str, bytes)):
+        return False
+    return isinstance(value, numbers.Number)
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -634,8 +646,10 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Skip empty or non-numeric values. Validation aggregation only supports
+                # numeric series; diagnostic fields such as executor/error_type are kept
+                # for dumps but should not participate in mean/std/pass@k reductions.
+                if not var_vals or not all(_is_numeric_metric_value(v) for v in var_vals):
                     continue
 
                 # compute mean and std

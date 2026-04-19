@@ -28,6 +28,7 @@ from verl.single_controller.ray.base import RayResourcePool
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
+from verl.utils.py_functional import ordered_union
 
 from .reward_model import RewardModelManager
 
@@ -329,10 +330,12 @@ class RewardLoopManager:
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
 
         reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = ordered_union(info.keys() for info in reward_extra_infos)
         non_tensor_batch = {}
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            values = np.empty(len(reward_extra_infos), dtype=object)
+            values[:] = [info.get(key) for info in reward_extra_infos]
+            non_tensor_batch[key] = values
 
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()

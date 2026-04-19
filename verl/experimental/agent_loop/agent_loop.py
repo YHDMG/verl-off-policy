@@ -38,6 +38,7 @@ from verl.utils.chat_template import apply_chat_template, initialize_system_prom
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.py_functional import ordered_union
 from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
@@ -835,9 +836,11 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = ordered_union(info.keys() for info in reward_extra_infos)
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            values = np.empty(len(inputs), dtype=object)
+            values[:] = [info.get(key) for info in reward_extra_infos]
+            non_tensor_batch[key] = values
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

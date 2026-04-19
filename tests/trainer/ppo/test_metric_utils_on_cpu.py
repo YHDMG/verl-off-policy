@@ -541,6 +541,24 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_skips_non_numeric_aux_fields(self):
+        """Non-numeric reward diagnostics should not break numeric validation aggregation."""
+        data_sources = ["code", "code", "code"]
+        sample_inputs = ["prompt1", "prompt1", "prompt1"]
+        infos_dict = {
+            "acc": [1.0, 0.0, 1.0],
+            "format_valid": [1.0, 1.0, 0.0],
+            "executor": ["firejail", "firejail", "firejail"],
+            "error_type": [None, "pytest_exec_failed", None],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("acc", result["code"])
+        self.assertIn("format_valid", result["code"])
+        self.assertNotIn("executor", result["code"])
+        self.assertNotIn("error_type", result["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

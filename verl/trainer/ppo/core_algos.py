@@ -41,6 +41,8 @@ _hear_metric_storage: Dict[int, Dict[str, Any]] = {}
 _hear_entropy_history: Dict[str, deque] = {}
 # 熵EMA状态，用于指数平滑统计
 _hear_entropy_ema_state: Dict[str, Dict[str, float]] = {}
+# 基于step级策略熵趋势的自适应HEAR控制状态
+_hear_entropy_control_state: Dict[int, Dict[str, Any]] = {}
 # 基于设备的目标熵与平滑熵（用于自适应裁剪）
 # 用于跟踪绘图step的全局计数器（按设备区分）
 # 用于存储历史ratio数据（用于绘图）：{device_id: [(step, original_ratios, corrected_ratios), ...]}
@@ -73,7 +75,26 @@ def get_hear_metrics(policy_loss_config: Any, metric_prefix: str = "actor/hear_"
         "high_entropy_guard/covered_token_gain_count": f"{metric_prefix}high_entropy_guard/covered_token_gain_count",
         "ratio/correction_count": f"{metric_prefix}ratio/correction_count",
         "ratio/correction_mean_diff": f"{metric_prefix}ratio/correction_mean_diff",
+        "ratio/pos_correction_count": f"{metric_prefix}ratio/pos_correction_count",
+        "ratio/neg_correction_count": f"{metric_prefix}ratio/neg_correction_count",
+        "ratio/pos_correction_mean_diff": f"{metric_prefix}ratio/pos_correction_mean_diff",
+        "ratio/neg_correction_mean_diff": f"{metric_prefix}ratio/neg_correction_mean_diff",
+        "ratio/pos_correction_trigger_log_threshold": f"{metric_prefix}ratio/pos_correction_trigger_log_threshold",
+        "ratio/neg_correction_trigger_log_threshold": f"{metric_prefix}ratio/neg_correction_trigger_log_threshold",
+        "ratio/pos_correction_trigger_ratio_threshold": f"{metric_prefix}ratio/pos_correction_trigger_ratio_threshold",
+        "ratio/neg_correction_trigger_ratio_threshold": f"{metric_prefix}ratio/neg_correction_trigger_ratio_threshold",
         "ratio/history_mean_log_ratio": f"{metric_prefix}ratio/history_mean_log_ratio",
+        "entropy/control_enabled": f"{metric_prefix}entropy/control_enabled",
+        "entropy/control_current_lambda": f"{metric_prefix}entropy/control_current_lambda",
+        "entropy/control_current_beta": f"{metric_prefix}entropy/control_current_beta",
+        "entropy/control_rise_streak": f"{metric_prefix}entropy/control_rise_streak",
+        "entropy/control_fall_streak": f"{metric_prefix}entropy/control_fall_streak",
+        "entropy/control_last_step_entropy": f"{metric_prefix}entropy/control_last_step_entropy",
+        "entropy/control_pending_step_entropy": f"{metric_prefix}entropy/control_pending_step_entropy",
+        "entropy/control_last_action": f"{metric_prefix}entropy/control_last_action",
+        "entropy/control_adjustment_count": f"{metric_prefix}entropy/control_adjustment_count",
+        "entropy/control_trend_slope": f"{metric_prefix}entropy/control_trend_slope",
+        "entropy/control_trend_sign": f"{metric_prefix}entropy/control_trend_sign",
     }
     for source_key, target_key in export_metric_map.items():
         value = clip_info.get(source_key)
@@ -102,8 +123,268 @@ def _get_default_hear_metric_storage(clip_low: float, clip_high: float) -> dict[
         "high_entropy_guard/covered_token_gain_count": None,
         "ratio/correction_count": 0.0,
         "ratio/correction_mean_diff": 0.0,
+        "ratio/pos_correction_count": 0.0,
+        "ratio/neg_correction_count": 0.0,
+        "ratio/pos_correction_mean_diff": 0.0,
+        "ratio/neg_correction_mean_diff": 0.0,
+        "ratio/pos_correction_trigger_log_threshold": None,
+        "ratio/neg_correction_trigger_log_threshold": None,
+        "ratio/pos_correction_trigger_ratio_threshold": None,
+        "ratio/neg_correction_trigger_ratio_threshold": None,
         "ratio/history_mean_log_ratio": 0.0,
+        "entropy/control_enabled": 0.0,
+        "entropy/control_current_lambda": None,
+        "entropy/control_current_beta": None,
+        "entropy/control_rise_streak": 0.0,
+        "entropy/control_fall_streak": 0.0,
+        "entropy/control_last_step_entropy": None,
+        "entropy/control_pending_step_entropy": None,
+        "entropy/control_last_action": 0.0,
+        "entropy/control_adjustment_count": 0.0,
+        "entropy/control_trend_slope": None,
+        "entropy/control_trend_sign": 0.0,
     }
+
+
+def _get_entropy_control_state(config_id: int, initial_lambda: float, initial_beta: float) -> dict[str, Any]:
+    state = _hear_entropy_control_state.get(config_id)
+    if state is None:
+        state = {
+            "current_lambda": float(initial_lambda),
+            "current_beta": float(initial_beta),
+            "last_step_entropy": None,
+            "pending_step": None,
+            "pending_entropy_sum": 0.0,
+            "pending_entropy_count": 0,
+            "entropy_window": [],
+            "rise_streak": 0,
+            "fall_streak": 0,
+            "last_action": 0,
+            "adjustment_count": 0,
+            "call_index": 0,
+        }
+        _hear_entropy_control_state[config_id] = state
+    return state
+
+
+def _apply_entropy_control_adjustment(
+    state: dict[str, Any],
+    finalized_entropy: float,
+    rise_steps: int,
+    fall_steps: int,
+    trend_window: int,
+    trend_slope_threshold: float,
+    lambda_up_step: float,
+    lambda_down_step: float,
+    beta_down_step: float,
+    beta_up_step: float,
+    lambda_min: float,
+    lambda_max: float | None,
+    beta_min: float,
+    beta_max: float | None,
+) -> None:
+    last_step_entropy = state.get("last_step_entropy")
+    state["last_action"] = 0
+    # Maintain a sliding window of step-level entropies.
+    window_size = max(int(trend_window), 2)
+    ent_window = list(state.get("entropy_window", []))
+    ent_window.append(float(finalized_entropy))
+    if len(ent_window) > window_size:
+        ent_window = ent_window[-window_size:]
+    state["entropy_window"] = ent_window
+
+    # Compute a simple linear-regression slope to tolerate small oscillations.
+    trend_slope = 0.0
+    trend_sign = 0
+    if len(ent_window) >= 2:
+        n = len(ent_window)
+        x_mean = (n - 1) / 2.0
+        denom = sum((i - x_mean) ** 2 for i in range(n))
+        if denom > 0:
+            y_mean = sum(ent_window) / n
+            num = sum((i - x_mean) *
+                      (ent_window[i] - y_mean) for i in range(n))
+            trend_slope = num / denom
+        thr = max(float(trend_slope_threshold), 0.0)
+        if trend_slope > thr:
+            trend_sign = 1
+        elif trend_slope < -thr:
+            trend_sign = -1
+
+    state["trend_slope"] = float(trend_slope)
+    state["trend_sign"] = int(trend_sign)
+
+    if last_step_entropy is None:
+        state["last_step_entropy"] = float(finalized_entropy)
+        return
+
+    if trend_sign > 0:
+        state["rise_streak"] = int(state.get("rise_streak", 0)) + 1
+        state["fall_streak"] = 0
+        if state["rise_streak"] >= rise_steps:
+            next_lambda = float(
+                state.get("current_lambda", lambda_min)) + lambda_up_step
+            if lambda_max is not None:
+                next_lambda = min(next_lambda, float(lambda_max))
+            next_beta = float(
+                state.get("current_beta", beta_min)) - beta_down_step
+            next_beta = max(next_beta, float(beta_min))
+            state["current_lambda"] = max(next_lambda, float(lambda_min))
+            state["current_beta"] = next_beta
+            state["rise_streak"] = 0
+            state["last_action"] = 1
+            state["adjustment_count"] = int(
+                state.get("adjustment_count", 0)) + 1
+    elif trend_sign < 0:
+        state["fall_streak"] = int(state.get("fall_streak", 0)) + 1
+        state["rise_streak"] = 0
+        if state["fall_streak"] >= fall_steps:
+            next_lambda = float(
+                state.get("current_lambda", lambda_min)) - lambda_down_step
+            next_lambda = max(next_lambda, float(lambda_min))
+            if lambda_max is not None:
+                next_lambda = min(next_lambda, float(lambda_max))
+            next_beta = float(
+                state.get("current_beta", beta_min)) + beta_up_step
+            if beta_max is not None:
+                next_beta = min(next_beta, float(beta_max))
+            state["current_lambda"] = next_lambda
+            state["current_beta"] = max(next_beta, float(beta_min))
+            state["fall_streak"] = 0
+            state["last_action"] = -1
+            state["adjustment_count"] = int(
+                state.get("adjustment_count", 0)) + 1
+    else:
+        # Neutral trend: clear streaks (hysteresis should be controlled by slope threshold/window).
+        state["rise_streak"] = 0
+        state["fall_streak"] = 0
+
+    state["last_step_entropy"] = float(finalized_entropy)
+
+
+def _update_entropy_control_state(
+    *,
+    policy_loss_config: Any,
+    entropy_mean_value: float | None,
+    default_lambda: float,
+    default_beta: float,
+    global_step: Any,
+) -> dict[str, float]:
+    config_id = id(policy_loss_config)
+    enabled = bool(getattr(policy_loss_config,
+                   "enable_entropy_adaptive_control", False))
+    state = _get_entropy_control_state(
+        config_id, initial_lambda=default_lambda, initial_beta=default_beta)
+
+    metrics = {
+        "entropy/control_enabled": float(enabled),
+        "entropy/control_current_lambda": float(state.get("current_lambda", default_lambda)),
+        "entropy/control_current_beta": float(state.get("current_beta", default_beta)),
+        "entropy/control_rise_streak": float(state.get("rise_streak", 0)),
+        "entropy/control_fall_streak": float(state.get("fall_streak", 0)),
+        "entropy/control_last_step_entropy": state.get("last_step_entropy"),
+        "entropy/control_pending_step_entropy": None,
+        "entropy/control_last_action": float(state.get("last_action", 0)),
+        "entropy/control_adjustment_count": float(state.get("adjustment_count", 0)),
+        "entropy/control_trend_slope": state.get("trend_slope"),
+        "entropy/control_trend_sign": float(state.get("trend_sign", 0)),
+    }
+
+    if not enabled or entropy_mean_value is None:
+        return metrics
+
+    rise_steps = max(
+        int(getattr(policy_loss_config, "entropy_rise_steps", 1)), 1)
+    fall_steps = max(
+        int(getattr(policy_loss_config, "entropy_fall_steps", 1)), 1)
+    trend_window = max(
+        int(getattr(policy_loss_config, "entropy_trend_window", 5)), 2)
+    trend_slope_threshold = float(
+        getattr(policy_loss_config, "entropy_trend_slope_threshold", 0.0))
+    lambda_up_step = max(
+        float(getattr(policy_loss_config, "entropy_lambda_up_step", 0.0)), 0.0)
+    lambda_down_step = max(
+        float(getattr(policy_loss_config, "entropy_lambda_down_step", 0.0)), 0.0)
+    beta_down_step = max(
+        float(getattr(policy_loss_config, "entropy_beta_down_step", 0.0)), 0.0)
+    beta_up_step = max(
+        float(getattr(policy_loss_config, "entropy_beta_up_step", 0.0)), 0.0)
+    lambda_min = max(
+        float(getattr(policy_loss_config, "entropy_adaptive_lambda_min", 0.0)), 0.0)
+    lambda_max = getattr(policy_loss_config,
+                         "entropy_adaptive_lambda_max", None)
+    beta_min = max(
+        float(getattr(policy_loss_config, "entropy_adaptive_beta_min", 0.0)), 0.0)
+    beta_max = getattr(policy_loss_config, "entropy_adaptive_beta_max", None)
+
+    state["current_lambda"] = max(
+        float(state.get("current_lambda", default_lambda)), lambda_min)
+    if lambda_max is not None:
+        state["current_lambda"] = min(
+            float(state["current_lambda"]), float(lambda_max))
+    state["current_beta"] = max(
+        float(state.get("current_beta", default_beta)), beta_min)
+    if beta_max is not None:
+        state["current_beta"] = min(
+            float(state["current_beta"]), float(beta_max))
+
+    if global_step is None:
+        state["call_index"] = int(state.get("call_index", 0)) + 1
+        step_key = ("call", int(state["call_index"]))
+    else:
+        step_key = global_step
+
+    pending_step = state.get("pending_step")
+    if pending_step is None:
+        state["pending_step"] = step_key
+        state["pending_entropy_sum"] = float(entropy_mean_value)
+        state["pending_entropy_count"] = 1
+    elif pending_step == step_key:
+        state["pending_entropy_sum"] = float(
+            state.get("pending_entropy_sum", 0.0)) + float(entropy_mean_value)
+        state["pending_entropy_count"] = int(
+            state.get("pending_entropy_count", 0)) + 1
+    else:
+        pending_count = max(int(state.get("pending_entropy_count", 0)), 1)
+        finalized_entropy = float(
+            state.get("pending_entropy_sum", 0.0)) / pending_count
+        _apply_entropy_control_adjustment(
+            state=state,
+            finalized_entropy=finalized_entropy,
+            rise_steps=rise_steps,
+            fall_steps=fall_steps,
+            trend_window=trend_window,
+            trend_slope_threshold=trend_slope_threshold,
+            lambda_up_step=lambda_up_step,
+            lambda_down_step=lambda_down_step,
+            beta_down_step=beta_down_step,
+            beta_up_step=beta_up_step,
+            lambda_min=lambda_min,
+            lambda_max=float(lambda_max) if lambda_max is not None else None,
+            beta_min=beta_min,
+            beta_max=float(beta_max) if beta_max is not None else None,
+        )
+        state["pending_step"] = step_key
+        state["pending_entropy_sum"] = float(entropy_mean_value)
+        state["pending_entropy_count"] = 1
+
+    pending_count = max(int(state.get("pending_entropy_count", 0)), 1)
+    metrics["entropy/control_current_lambda"] = float(
+        state.get("current_lambda", default_lambda))
+    metrics["entropy/control_current_beta"] = float(
+        state.get("current_beta", default_beta))
+    metrics["entropy/control_rise_streak"] = float(state.get("rise_streak", 0))
+    metrics["entropy/control_fall_streak"] = float(state.get("fall_streak", 0))
+    metrics["entropy/control_last_step_entropy"] = state.get(
+        "last_step_entropy")
+    metrics["entropy/control_pending_step_entropy"] = float(
+        state.get("pending_entropy_sum", 0.0)) / pending_count
+    metrics["entropy/control_last_action"] = float(state.get("last_action", 0))
+    metrics["entropy/control_adjustment_count"] = float(
+        state.get("adjustment_count", 0))
+    metrics["entropy/control_trend_slope"] = state.get("trend_slope")
+    metrics["entropy/control_trend_sign"] = float(state.get("trend_sign", 0))
+    return metrics
 
 
 def _update_hear_ratio_bucket_metrics(
@@ -121,18 +402,23 @@ def _update_hear_ratio_bucket_metrics(
         return
 
     bucket_values = ratio[bucket_mask]
-    storage_dict[f"ratio/{bucket_name}_mean"] = float(bucket_values.mean().item())
-    storage_dict[f"ratio/{bucket_name}_std"] = float(bucket_values.std(unbiased=False).item())
-    storage_dict[f"ratio/{bucket_name}_max"] = float(bucket_values.max().item())
-    storage_dict[f"ratio/{bucket_name}_min"] = float(bucket_values.min().item())
+    storage_dict[f"ratio/{bucket_name}_mean"] = float(
+        bucket_values.mean().item())
+    storage_dict[f"ratio/{bucket_name}_std"] = float(
+        bucket_values.std(unbiased=False).item())
+    storage_dict[f"ratio/{bucket_name}_max"] = float(
+        bucket_values.max().item())
+    storage_dict[f"ratio/{bucket_name}_min"] = float(
+        bucket_values.min().item())
     if bucket_name == "pos_adv":
-        storage_dict["ratio/pos_adv_exceed_high"] = float((bucket_values > clip_high).float().mean().item())
+        storage_dict["ratio/pos_adv_exceed_high"] = float(
+            (bucket_values > clip_high).float().mean().item())
     elif bucket_name == "neg_adv":
-        storage_dict["ratio/neg_adv_below_low"] = float((bucket_values < clip_low).float().mean().item())
+        storage_dict["ratio/neg_adv_below_low"] = float(
+            (bucket_values < clip_low).float().mean().item())
 
 
 def get_ratio_history(device_id: str, max_size: int = 10) -> deque:
-
     """
     获取或创建指定设备的历史 log-ratio 统计队列
     Args:
@@ -145,7 +431,8 @@ def get_ratio_history(device_id: str, max_size: int = 10) -> deque:
     if device_id not in _hear_ratio_history:
         _hear_ratio_history[device_id] = deque(maxlen=max_size)
     elif _hear_ratio_history[device_id].maxlen != max_size:
-        _hear_ratio_history[device_id] = deque(_hear_ratio_history[device_id], maxlen=max_size)
+        _hear_ratio_history[device_id] = deque(
+            _hear_ratio_history[device_id], maxlen=max_size)
     return _hear_ratio_history[device_id]
 
 
@@ -193,96 +480,151 @@ def _summarize_log_ratio_history(history_queue: deque) -> tuple[float | None, fl
             weighted_mu_sum += mean_log_ratio * count
             total_count += count
 
-        entry_max_log_ratio = float(entry[3]) if len(entry) >= 4 else mean_log_ratio
-        max_log_ratio = entry_max_log_ratio if max_log_ratio is None else max(max_log_ratio, entry_max_log_ratio)
+        entry_max_log_ratio = float(entry[3]) if len(
+            entry) >= 4 else mean_log_ratio
+        max_log_ratio = entry_max_log_ratio if max_log_ratio is None else max(
+            max_log_ratio, entry_max_log_ratio)
 
-    mean_log_ratio = None if total_count <= 0 else (weighted_mu_sum / total_count)
+    mean_log_ratio = None if total_count <= 0 else (
+        weighted_mu_sum / total_count)
     return mean_log_ratio, max_log_ratio, total_count
+
 
 @deprecated("Legacy sequence-level helper kept for backward compatibility.")
 def adaptive_ratio_correction(
     seq_importance_ratio: torch.Tensor,
-    advantages: torch.Tensor, 
+    advantages: torch.Tensor,
     response_mask: torch.Tensor,
     history_queue: deque,
     clip_ratio_low: float,
     clip_ratio_high: float,
     beta: float = 1.0,
     correction_lambda: float = 1.0,
+    neg_correction_lambda: float | None = None,
 ) -> torch.Tensor:
-
 
     if len(history_queue) == 0:
         return seq_importance_ratio
     positive_adv_mask = (advantages > 0) & (response_mask > 0)
-    if not torch.any(positive_adv_mask):
+    negative_adv_mask = (advantages < 0) & (response_mask > 0)
+    if not (torch.any(positive_adv_mask) or torch.any(negative_adv_mask)):
         return seq_importance_ratio
 
-    history_anchor, _, _, total_count = _compute_weighted_log_ratio_anchor(history_queue, beta=beta)
-    if history_anchor is None or total_count <= 0:
+    abs_beta = abs(float(beta))
+    history_anchor_high, mean_log_ratio, std_log_ratio, total_count = _compute_weighted_log_ratio_anchor(
+        history_queue, beta=abs_beta
+    )
+    if history_anchor_high is None or total_count <= 0:
         return seq_importance_ratio
+    history_anchor_low = float(mean_log_ratio) - \
+        abs_beta * float(std_log_ratio)
 
     log_ratio = torch.log(seq_importance_ratio.clamp_min(1e-8))
     log_clip_high = float(np.log(max(1.0 + clip_ratio_high, 1e-8)))
-    trigger_threshold = max(history_anchor, log_clip_high)
+    log_clip_low = float(np.log(max(1.0 - clip_ratio_low, 1e-8)))
+    trigger_threshold_high = max(float(history_anchor_high), log_clip_high)
+    trigger_threshold_low = min(float(history_anchor_low), log_clip_low)
 
-    needs_correction = (
-        positive_adv_mask &
-        (log_ratio > trigger_threshold)
-    )
-
-    if not torch.any(needs_correction):
+    needs_pos = positive_adv_mask & (log_ratio > trigger_threshold_high)
+    needs_neg = negative_adv_mask & (log_ratio < trigger_threshold_low)
+    if not (torch.any(needs_pos) or torch.any(needs_neg)):
         return seq_importance_ratio
+
     correction_lambda = max(float(correction_lambda), 0.0)
-    anchor_tensor = log_ratio.new_tensor(history_anchor)
+    if neg_correction_lambda is None:
+        neg_correction_lambda = correction_lambda
+    neg_correction_lambda = max(float(neg_correction_lambda), 0.0)
+
     corrected_log_ratio = log_ratio.clone()
-    corrected_log_ratio[needs_correction] = (
-        log_ratio[needs_correction] + correction_lambda * anchor_tensor
-    ) / (1.0 + correction_lambda)
+    if torch.any(needs_pos) and correction_lambda > 0.0:
+        anchor_tensor_high = log_ratio.new_tensor(float(history_anchor_high))
+        corrected_log_ratio[needs_pos] = (
+            log_ratio[needs_pos] + correction_lambda * anchor_tensor_high
+        ) / (1.0 + correction_lambda)
+    if torch.any(needs_neg) and neg_correction_lambda > 0.0:
+        anchor_tensor_low = log_ratio.new_tensor(float(history_anchor_low))
+        corrected_log_ratio[needs_neg] = (
+            log_ratio[needs_neg] + neg_correction_lambda * anchor_tensor_low
+        ) / (1.0 + neg_correction_lambda)
+
     return torch.exp(corrected_log_ratio)
 
 
 def adaptive_ratio_correction_token(
     token_log_ratio: torch.Tensor,
-    advantages: torch.Tensor, 
+    advantages: torch.Tensor,
     response_mask: torch.Tensor,
     history_queue: deque,
     clip_high: float,
     beta: float = 1.0,
     correction_lambda: float = 1.0,
-
+    clip_low: float | None = None,
+    neg_correction_lambda: float | None = None,
 ) -> torch.Tensor:
-
     """
     基于历史健康 log-ratio 锚点的 token-level 矫正。
     """
     if len(history_queue) == 0:
         return torch.exp(token_log_ratio)
+
     positive_adv_mask = (advantages > 0) & (response_mask > 0)
-    if not torch.any(positive_adv_mask):
+    negative_adv_mask = (advantages < 0) & (response_mask > 0)
+    if not (torch.any(positive_adv_mask) or torch.any(negative_adv_mask)):
         return torch.exp(token_log_ratio)
 
-    history_anchor, _, _, total_count = _compute_weighted_log_ratio_anchor(history_queue, beta=beta)
-    if history_anchor is None or total_count <= 0:
+    abs_beta = abs(float(beta))
+    history_anchor_high, mean_log_ratio, std_log_ratio, total_count = _compute_weighted_log_ratio_anchor(
+        history_queue, beta=abs_beta
+    )
+    if history_anchor_high is None or total_count <= 0:
         return torch.exp(token_log_ratio)
+
+    # For negative advantages, use a symmetric lower anchor: mean - beta * std.
+    history_anchor_low = float(mean_log_ratio) - \
+        abs_beta * float(std_log_ratio)
 
     log_clip_high = float(np.log(max(clip_high, 1e-8)))
-    trigger_threshold = max(history_anchor, log_clip_high)
+    trigger_threshold_high = max(float(history_anchor_high), log_clip_high)
 
-    needs_correction = (
-        positive_adv_mask &
-        (token_log_ratio > trigger_threshold)
+    trigger_threshold_low = None
+    if clip_low is not None:
+        # clip_low should be in ratio space (e.g., 1 - eps).
+        log_clip_low = float(np.log(max(float(clip_low), 1e-8)))
+        trigger_threshold_low = min(float(history_anchor_low), log_clip_low)
+
+    needs_pos = positive_adv_mask & (token_log_ratio > trigger_threshold_high)
+    needs_neg = (
+        negative_adv_mask & (token_log_ratio < trigger_threshold_low)
+        if trigger_threshold_low is not None
+        else token_log_ratio.new_zeros(token_log_ratio.shape, dtype=torch.bool)
     )
-    if not torch.any(needs_correction):
+
+    if not (torch.any(needs_pos) or torch.any(needs_neg)):
         return torch.exp(token_log_ratio)
 
     correction_lambda = max(float(correction_lambda), 0.0)
-    anchor_tensor = token_log_ratio.new_tensor(history_anchor)
+    if neg_correction_lambda is None:
+        neg_correction_lambda = correction_lambda
+    neg_correction_lambda = max(float(neg_correction_lambda), 0.0)
+
     corrected_log_ratio = token_log_ratio.clone()
-    corrected_log_ratio[needs_correction] = (
-        token_log_ratio[needs_correction] + correction_lambda * anchor_tensor
-    ) / (1.0 + correction_lambda)
+    if torch.any(needs_pos) and correction_lambda > 0.0:
+        anchor_tensor_high = token_log_ratio.new_tensor(
+            float(history_anchor_high))
+        corrected_log_ratio[needs_pos] = (
+            token_log_ratio[needs_pos] + correction_lambda * anchor_tensor_high
+        ) / (1.0 + correction_lambda)
+
+    if torch.any(needs_neg) and neg_correction_lambda > 0.0:
+        anchor_tensor_low = token_log_ratio.new_tensor(
+            float(history_anchor_low))
+        corrected_log_ratio[needs_neg] = (
+            token_log_ratio[needs_neg] +
+            neg_correction_lambda * anchor_tensor_low
+        ) / (1.0 + neg_correction_lambda)
+
     return torch.exp(corrected_log_ratio)
+
 
 @deprecated("Legacy helper kept for backward compatibility.")
 def _compute_effective_advantage_token(
@@ -310,6 +652,7 @@ def _compute_effective_advantage_token(
         pos_neg_ratio = pos_contrib / (neg_contrib + ratio.new_tensor(eps))
     return effective_adv, pos_neg_ratio
 
+
 def _select_high_entropy_tokens(
     token_entropy: torch.Tensor | None,
     response_mask: torch.Tensor,
@@ -333,6 +676,34 @@ def _select_high_entropy_tokens(
     threshold_value = topk_values[-1]
     high_entropy_mask = (token_entropy >= threshold_value) & valid_mask
     return high_entropy_mask if torch.any(high_entropy_mask) else None
+
+
+def _subsample_existing_mask(mask: torch.Tensor | None, target_ratio: float) -> torch.Tensor | None:
+    """Select a deterministic subset from an existing mask without re-ranking by entropy."""
+    if mask is None:
+        return None
+
+    flat_mask = mask.reshape(-1).bool()
+    candidate_indices = torch.nonzero(flat_mask, as_tuple=False).flatten()
+    candidate_count = int(candidate_indices.numel())
+    if candidate_count == 0:
+        return None
+
+    ratio = float(np.clip(target_ratio, 0.0, 1.0))
+    if ratio <= 0.0:
+        return None
+
+    k = max(1, int(candidate_count * ratio))
+    k = min(k, candidate_count)
+    if k == candidate_count:
+        return mask.bool()
+
+    # Evenly sample across the already-selected token set to avoid re-selecting by entropy.
+    positions = (torch.arange(k, device=candidate_indices.device) * candidate_count) // k
+    selected_indices = candidate_indices[positions]
+    selected_flat_mask = torch.zeros_like(flat_mask, dtype=torch.bool)
+    selected_flat_mask[selected_indices] = True
+    return selected_flat_mask.view_as(mask)
 
 
 def _compute_high_entropy_coverage(
@@ -408,19 +779,27 @@ def _adjust_clip_for_high_entropy_tokens(
     )
     assert coverage_before is not None
     covered_before_count = int(
-        (((corrected_ratio >= ratio_low_cur) & (corrected_ratio <= ratio_high_cur) & high_entropy_mask).sum().item())
+        (((corrected_ratio >= ratio_low_cur) & (corrected_ratio <=
+         ratio_high_cur) & high_entropy_mask).sum().item())
     )
     total_selected_count = int(high_entropy_count.item())
-    uncovered_before_count = max(total_selected_count - covered_before_count, 0)
+    uncovered_before_count = max(
+        total_selected_count - covered_before_count, 0)
     stats["high_entropy_guard/coverage_before"] = float(coverage_before)
-    stats["high_entropy_guard/covered_token_count_before"] = float(covered_before_count)
-    stats["high_entropy_guard/uncovered_token_count_before"] = float(uncovered_before_count)
+    stats["high_entropy_guard/covered_token_count_before"] = float(
+        covered_before_count)
+    stats["high_entropy_guard/uncovered_token_count_before"] = float(
+        uncovered_before_count)
     if coverage_before >= target_ratio:
         stats["high_entropy_guard/coverage_after"] = float(coverage_before)
-        stats["high_entropy_guard/clip_low_delta"] = float(ratio_low_cur - ratio_low_initial)
-        stats["high_entropy_guard/clip_high_delta"] = float(ratio_high_cur - ratio_high_initial)
-        stats["high_entropy_guard/covered_token_count_after"] = float(covered_before_count)
-        stats["high_entropy_guard/uncovered_token_count_after"] = float(uncovered_before_count)
+        stats["high_entropy_guard/clip_low_delta"] = float(
+            ratio_low_cur - ratio_low_initial)
+        stats["high_entropy_guard/clip_high_delta"] = float(
+            ratio_high_cur - ratio_high_initial)
+        stats["high_entropy_guard/covered_token_count_after"] = float(
+            covered_before_count)
+        stats["high_entropy_guard/uncovered_token_count_after"] = float(
+            uncovered_before_count)
         stats["high_entropy_guard/covered_token_gain_count"] = 0.0
         return ratio_low_cur, ratio_high_cur, float(coverage_before), stats
 
@@ -462,16 +841,24 @@ def _adjust_clip_for_high_entropy_tokens(
 
     stats["high_entropy_guard/coverage_after"] = float(achieved)
     stats["high_entropy_guard/iterations_used"] = float(iterations_used)
-    stats["high_entropy_guard/clip_low_delta"] = float(ratio_low_cur - ratio_low_initial)
-    stats["high_entropy_guard/clip_high_delta"] = float(ratio_high_cur - ratio_high_initial)
+    stats["high_entropy_guard/clip_low_delta"] = float(
+        ratio_low_cur - ratio_low_initial)
+    stats["high_entropy_guard/clip_high_delta"] = float(
+        ratio_high_cur - ratio_high_initial)
     covered_after_count = int(
-        (((corrected_ratio >= ratio_low_cur) & (corrected_ratio <= ratio_high_cur) & high_entropy_mask).sum().item())
+        (((corrected_ratio >= ratio_low_cur) & (corrected_ratio <=
+         ratio_high_cur) & high_entropy_mask).sum().item())
     )
     uncovered_after_count = max(total_selected_count - covered_after_count, 0)
-    stats["high_entropy_guard/covered_token_count_after"] = float(covered_after_count)
-    stats["high_entropy_guard/uncovered_token_count_after"] = float(uncovered_after_count)
-    stats["high_entropy_guard/covered_token_gain_count"] = float(covered_after_count - covered_before_count)
+    stats["high_entropy_guard/covered_token_count_after"] = float(
+        covered_after_count)
+    stats["high_entropy_guard/uncovered_token_count_after"] = float(
+        uncovered_after_count)
+    stats["high_entropy_guard/covered_token_gain_count"] = float(
+        covered_after_count - covered_before_count)
     return ratio_low_cur, ratio_high_cur, float(achieved), stats
+
+
 PolicyLossFn = Callable[
     [
         torch.Tensor,  # old_log_prob
@@ -523,6 +910,47 @@ def get_policy_loss_fn(name):
     return POLICY_LOSS_REGISTRY[loss_name]
 
 
+def _normalize_group_key(value: Any) -> Any:
+    """Normalize arbitrary uid values into stable, hashable Python keys."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return tuple(value.tolist())
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return value.item()
+        return tuple(value.detach().cpu().tolist())
+    if isinstance(value, list):
+        return tuple(value)
+    return value
+
+
+def _build_group_ids(uid: Any, batch_size: int, device: torch.device) -> tuple[torch.Tensor, int]:
+    """Convert arbitrary uid containers into contiguous group ids."""
+    if uid is None:
+        raise ValueError("GEPO requires `uid` to identify response groups.")
+
+    if isinstance(uid, torch.Tensor):
+        uid_values = uid.detach().cpu().tolist()
+    elif isinstance(uid, np.ndarray):
+        uid_values = uid.tolist()
+    else:
+        uid_values = list(uid)
+
+    if len(uid_values) != batch_size:
+        raise ValueError(
+            f"GEPO expects {batch_size} uid values, but got {len(uid_values)}.")
+
+    group_lookup: dict[Any, int] = {}
+    group_ids: list[int] = []
+    for value in uid_values:
+        key = _normalize_group_key(value)
+        if key not in group_lookup:
+            group_lookup[key] = len(group_lookup)
+        group_ids.append(group_lookup[key])
+    return torch.tensor(group_ids, dtype=torch.long, device=device), len(group_lookup)
+
+
 class AdvantageEstimator(str, Enum):
     """Using an enumeration class to avoid spelling errors in adv_estimator.
 
@@ -561,7 +989,8 @@ def register_adv_est(name_or_enum: str | AdvantageEstimator) -> Any:
     """
 
     def decorator(fn):
-        name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+        name = name_or_enum.value if isinstance(
+            name_or_enum, Enum) else name_or_enum
         if name in ADV_ESTIMATOR_REGISTRY and ADV_ESTIMATOR_REGISTRY[name] != fn:
             raise ValueError(
                 f"Adv estimator {name} has already been registered: {ADV_ESTIMATOR_REGISTRY[name]} vs {fn}"
@@ -582,7 +1011,8 @@ def get_adv_estimator_fn(name_or_enum):
     Returns:
         `(callable)`: The advantage estimator function.
     """
-    name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+    name = name_or_enum.value if isinstance(
+        name_or_enum, Enum) else name_or_enum
     if name not in ADV_ESTIMATOR_REGISTRY:
         raise ValueError(f"Unknown advantage estimator simply: {name}")
     return ADV_ESTIMATOR_REGISTRY[name]
@@ -650,7 +1080,8 @@ def get_kl_controller(kl_ctrl):
         raise NotImplementedError
 
 
-@register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
+# or simply: @register_adv_est("gae")
+@register_adv_est(AdvantageEstimator.GAE)
 def compute_gae_advantage_return(
     token_level_rewards: torch.Tensor,
     values: torch.Tensor,
@@ -686,12 +1117,15 @@ def compute_gae_advantage_return(
         gen_len = token_level_rewards.shape[-1]
 
         for t in reversed(range(gen_len)):
-            delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+            delta = token_level_rewards[:, t] + \
+                gamma * nextvalues - values[:, t]
             lastgaelam_ = delta + gamma * lam * lastgaelam
 
             # skip values and TD-error on observation tokens
-            nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
-            lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
+            nextvalues = values[:, t] * response_mask[:,
+                                                      t] + (1 - response_mask[:, t]) * nextvalues
+            lastgaelam = lastgaelam_ * \
+                response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
 
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
@@ -702,7 +1136,8 @@ def compute_gae_advantage_return(
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
-@register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
+# or simply: @register_adv_est("grpo")
+@register_adv_est(AdvantageEstimator.GRPO)
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -761,7 +1196,8 @@ def compute_grpo_outcome_advantage(
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                scores[i] = (scores[i] - id2mean[index[i]]) / \
+                    (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
@@ -787,7 +1223,8 @@ def compute_grpo_vectorized_outcome_advantage(
     with torch.no_grad():
         scores = token_level_rewards.sum(dim=-1)
         g = as_torch_index(index, device=scores.device)
-        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+        mean_g, std_g, _ = group_mean_std(
+            scores, g, eps=epsilon, device=scores.device)
         if norm_adv_by_std_in_grpo:
             scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
         else:
@@ -796,7 +1233,8 @@ def compute_grpo_vectorized_outcome_advantage(
         return advantages, advantages
 
 
-@register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
+# or simply: @register_adv_est("gdpo")
+@register_adv_est(AdvantageEstimator.GDPO)
 def compute_gdpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -855,7 +1293,8 @@ def compute_gdpo_outcome_advantage(
         )
         device = token_level_rewards.device
         prompt_length = batch["prompts"].size(1)
-        valid_response_length = batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
+        valid_response_length = batch["attention_mask"][:, prompt_length:].sum(
+            dim=1) - 1
 
         score_list = []
         for key in gdpo_reward_keys:
@@ -865,9 +1304,11 @@ def compute_gdpo_outcome_advantage(
                 f"Make sure your compute_score returns a dict containing '{key}'."
             )
             comp = non_tensor_batch[key]
-            rm_score = torch.tensor(np.asarray(comp, dtype=np.float32), device=device)
+            rm_score = torch.tensor(np.asarray(
+                comp, dtype=np.float32), device=device)
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-            rm_scores[torch.arange(rm_scores.size(0), device=device), valid_response_length] = rm_score
+            rm_scores[torch.arange(rm_scores.size(
+                0), device=device), valid_response_length] = rm_score
             score_list.append(rm_scores)
 
         gdpo_weights = config.get("gdpo_reward_weights", None)
@@ -880,9 +1321,11 @@ def compute_gdpo_outcome_advantage(
     num_scores = len(score_list)
 
     if reward_weights is not None:
-        weights = torch.tensor(reward_weights, dtype=torch.float32, device=token_level_rewards.device)
+        weights = torch.tensor(
+            reward_weights, dtype=torch.float32, device=token_level_rewards.device)
     else:
-        weights = torch.ones(num_scores, dtype=torch.float32, device=token_level_rewards.device)
+        weights = torch.ones(num_scores, dtype=torch.float32,
+                             device=token_level_rewards.device)
 
     new_advantage = None
 
@@ -901,12 +1344,14 @@ def compute_gdpo_outcome_advantage(
         else:
             new_advantage += weights[i] * normalized_score
 
-    advantages = verl_F.masked_whiten(new_advantage, response_mask) * response_mask
+    advantages = verl_F.masked_whiten(
+        new_advantage, response_mask) * response_mask
 
     return advantages, advantages
 
 
-@register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
+# or simply: @register_adv_est("grpo_passk")
+@register_adv_est(AdvantageEstimator.GRPO_PASSK)
 def compute_grpo_passk_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -1016,13 +1461,15 @@ def compute_reinforce_plus_plus_baseline_outcome_advantage(
         for i in range(bsz):
             scores[i] = scores[i] - id2mean[index[i]]
 
-        scores = scores.unsqueeze(-1).tile([1, response_length]) * response_mask
+        scores = scores.unsqueeze(-1).tile([1,
+                                            response_length]) * response_mask
         scores = verl_F.masked_whiten(scores, response_mask) * response_mask
 
     return scores, scores
 
 
-@register_adv_est(AdvantageEstimator.RLOO)  # or simply: @register_adv_est("rloo")
+# or simply: @register_adv_est("rloo")
+@register_adv_est(AdvantageEstimator.RLOO)
 def compute_rloo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -1074,7 +1521,8 @@ def compute_rloo_outcome_advantage(
     return scores, scores
 
 
-@register_adv_est(AdvantageEstimator.OPO)  # or simply: @register_adv_est("opo")
+# or simply: @register_adv_est("opo")
+@register_adv_est(AdvantageEstimator.OPO)
 def compute_opo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -1118,7 +1566,8 @@ def compute_opo_outcome_advantage(
             elif len(id2score[idx]) > 1:
                 score_tensor = torch.stack(id2score[idx])
                 len_tensor = torch.stack(id2len[idx])
-                id2bsl[idx] = (len_tensor * score_tensor).sum() / len_tensor.sum()
+                id2bsl[idx] = (len_tensor * score_tensor).sum() / \
+                    len_tensor.sum()
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
@@ -1128,7 +1577,8 @@ def compute_opo_outcome_advantage(
     return scores, scores
 
 
-@register_adv_est(AdvantageEstimator.REINFORCE_PLUS_PLUS)  # or simply: @register_adv_est("reinforce_plus_plus")
+# or simply: @register_adv_est("reinforce_plus_plus")
+@register_adv_est(AdvantageEstimator.REINFORCE_PLUS_PLUS)
 def compute_reinforce_plus_plus_outcome_advantage(
     token_level_rewards: torch.Tensor, response_mask: torch.Tensor, config: Optional[AlgoConfig] = None, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1167,7 +1617,8 @@ def compute_reinforce_plus_plus_outcome_advantage(
     return advantages, returns
 
 
-@register_adv_est(AdvantageEstimator.REMAX)  # or simply: @register_adv_est("remax")
+# or simply: @register_adv_est("remax")
+@register_adv_est(AdvantageEstimator.REMAX)
 def compute_remax_outcome_advantage(
     token_level_rewards: torch.Tensor,
     reward_baselines: torch.Tensor,
@@ -1197,13 +1648,15 @@ def compute_remax_outcome_advantage(
     """
 
     with torch.no_grad():
-        returns = (token_level_rewards * response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+        returns = (token_level_rewards *
+                   response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
         advantages = returns - reward_baselines.unsqueeze(-1) * response_mask
 
     return advantages, returns
 
 
-@register_adv_est(AdvantageEstimator.GPG)  # or simply: @register_adv_est("gpg")
+# or simply: @register_adv_est("gpg")
+@register_adv_est(AdvantageEstimator.GPG)
 def compute_gpg_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -1266,7 +1719,8 @@ def compute_gpg_outcome_advantage(
     return scores, scores
 
 
-@register_adv_est(AdvantageEstimator.RLOO_VECTORIZED)  # or simply: @register_adv_est("rloo_vectorized")
+# or simply: @register_adv_est("rloo_vectorized")
+@register_adv_est(AdvantageEstimator.RLOO_VECTORIZED)
 def compute_rloo_vectorized_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -1294,10 +1748,12 @@ def compute_rloo_vectorized_outcome_advantage(
     scores = token_level_rewards.sum(dim=-1)
 
     with torch.no_grad():
-        inv = torch.from_numpy(np.unique(index, return_inverse=True)[1]).to(scores.device)
+        inv = torch.from_numpy(np.unique(index, return_inverse=True)[
+                               1]).to(scores.device)
 
         c = torch.bincount(inv)[inv].to(scores.dtype)
-        adv = ((c * scores - torch.bincount(inv, weights=scores)[inv]) / (c - 1).clamp_min(1)) * (c > 1)
+        adv = ((c * scores - torch.bincount(inv, weights=scores)
+               [inv]) / (c - 1).clamp_min(1)) * (c > 1)
 
         adv = adv.unsqueeze(-1) * response_mask
 
@@ -1356,7 +1812,8 @@ def compute_optimal_token_baseline_advantage(
         device = token_level_rewards.device
 
         # Compute returns (reward-to-go) for each timestep
-        returns = (token_level_rewards * response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+        returns = (token_level_rewards *
+                   response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
 
         # Step 1: Compute w_per_timestep = 1 - 2π_t + Σπ²)
         pi_t = torch.exp(old_log_probs)
@@ -1396,8 +1853,10 @@ def compute_optimal_token_baseline_advantage(
             # Compute per-timestep baseline: B_t = Σ[G_t × W_t] / Σ[W_t]
             # where W_t = Σ_{j=1}^t ||s_j||² (cumulative path variance)
             # Shape: [seq_len]
-            numerator = (returns_group * w_cumulative_group * mask_group).sum(dim=0)  # Sum over trajectories
-            denominator = (w_cumulative_group * mask_group).sum(dim=0) + epsilon
+            numerator = (returns_group * w_cumulative_group *
+                         mask_group).sum(dim=0)  # Sum over trajectories
+            denominator = (w_cumulative_group *
+                           mask_group).sum(dim=0) + epsilon
 
             baseline_per_step = numerator / denominator  # [seq_len]
 
@@ -1411,9 +1870,11 @@ def compute_optimal_token_baseline_advantage(
                 sorted_lengths, _ = torch.sort(response_lengths)
                 max_length = int(sorted_lengths[-1].item())
                 second_max_length = int(sorted_lengths[-2].item())
-                max_length_idx = (response_lengths == max_length).nonzero(as_tuple=True)[0]
+                max_length_idx = (response_lengths == max_length).nonzero(
+                    as_tuple=True)[0]
                 if max_length_idx.numel() == 1 and max_length > second_max_length:
-                    max_length_traj_idx = trajectory_indices[int(max_length_idx[0])]
+                    max_length_traj_idx = trajectory_indices[int(
+                        max_length_idx[0])]
                     baselines[max_length_traj_idx, second_max_length:] = 0.0
 
         # Compute advantages: A_t = G_t - B_t
@@ -1471,7 +1932,8 @@ def compute_multi_turn_optimal_token_baseline_advantage(
     """
     with torch.no_grad():
         # Compute returns (reward-to-go) for each timestep
-        token_returns = (token_level_rewards * response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+        token_returns = (
+            token_level_rewards * response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
 
         # Step 1: Compute w_per_timestep = 1 - 2π_t + Σπ²)
         pi_t = torch.exp(old_log_probs)
@@ -1488,8 +1950,10 @@ def compute_multi_turn_optimal_token_baseline_advantage(
 
         # Step 4: Concatenate returns and w_cumulative for each trajectory
         # This allows us to compute baseline per timestep for each trajectory
-        response_lengths = response_mask.sum(dim=-1).to(dtype=torch.long)  # [shape: (bs * n, )]
-        max_response_length = int(response_lengths.max().item()) if response_lengths.numel() > 0 else 0
+        response_lengths = response_mask.sum(
+            dim=-1).to(dtype=torch.long)  # [shape: (bs * n, )]
+        max_response_length = int(response_lengths.max(
+        ).item()) if response_lengths.numel() > 0 else 0
         all_w_values = w_cumulative.new_zeros(
             (len(response_lengths), max_response_length)
         )  # [shape: (bs * n, max_response_length)]
@@ -1514,7 +1978,8 @@ def compute_multi_turn_optimal_token_baseline_advantage(
 
         for _, trajectory_indices in prompt_groups.items():
             N = len(trajectory_indices)
-            traj_idx = torch.tensor(trajectory_indices, device=all_returns.device)
+            traj_idx = torch.tensor(
+                trajectory_indices, device=all_returns.device)
 
             if N == 1:
                 # Single trajectory - no baseline (keep original reward as advantage)
@@ -1522,10 +1987,13 @@ def compute_multi_turn_optimal_token_baseline_advantage(
                 continue
 
             # Extract group data
-            w_group = all_w_values[traj_idx]  # [shape: (N, max_response_length)]
-            R_group = all_returns[traj_idx]  # [shape: (N, max_response_length)]
+            # [shape: (N, max_response_length)]
+            w_group = all_w_values[traj_idx]
+            # [shape: (N, max_response_length)]
+            R_group = all_returns[traj_idx]
             # Direct optimal baseline - single value for all in group
-            b_star = (R_group * w_group).sum(dim=0) / (w_group.sum(dim=0) + epsilon)
+            b_star = (R_group * w_group).sum(dim=0) / \
+                (w_group.sum(dim=0) + epsilon)
             # Convert to match baselines dtype (epsilon can cause float64 promotion)
             baselines[traj_idx] = b_star.to(baselines.dtype)
 
@@ -1536,21 +2004,27 @@ def compute_multi_turn_optimal_token_baseline_advantage(
                 sorted_lengths, _ = torch.sort(response_lengths_group)
                 max_length = int(sorted_lengths[-1].item())
                 second_max_length = int(sorted_lengths[-2].item())
-                max_length_idx = (response_lengths_group == max_length).nonzero(as_tuple=True)[0]
+                max_length_idx = (response_lengths_group ==
+                                  max_length).nonzero(as_tuple=True)[0]
                 if max_length_idx.numel() == 1 and max_length > second_max_length:
-                    max_length_traj_idx = trajectory_indices[int(max_length_idx[0])]
+                    max_length_traj_idx = trajectory_indices[int(
+                        max_length_idx[0])]
                     baselines[max_length_traj_idx, second_max_length:] = 0.0
 
         # Compute advantages
-        all_advantages = all_returns - baselines  # [shape: (bs * n, max_response_length)]
+        # [shape: (bs * n, max_response_length)]
+        all_advantages = all_returns - baselines
 
-        advantages = torch.zeros_like(token_returns)  # [shape: (bs * n, turn * response_length)]
+        # [shape: (bs * n, turn * response_length)]
+        advantages = torch.zeros_like(token_returns)
         for i in range(len(response_lengths)):
             if response_lengths[i] == 0:
                 continue
-            advantages[i, response_mask[i].bool()] = all_advantages[i, : response_lengths[i]]
+            advantages[i, response_mask[i].bool()] = all_advantages[i,
+                                                                    : response_lengths[i]]
 
-        advantages = advantages * response_mask  # [shape: (bs * n * turn, response_length)]
+        # [shape: (bs * n * turn, response_length)]
+        advantages = advantages * response_mask
 
     return advantages, token_returns
 
@@ -1606,27 +2080,32 @@ def agg_loss(
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
-                raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
+                raise ValueError(
+                    "(global) batch_num_tokens is required when dp_size > 1")
             batch_num_tokens = loss_mask.sum()
         if torch.is_tensor(batch_num_tokens):
             if batch_num_tokens.item() == 0:
                 return zero_loss
         elif batch_num_tokens == 0:
             return zero_loss
-        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+        loss = verl_F.masked_sum(loss_mat, loss_mask) / \
+            batch_num_tokens * dp_size
     elif loss_agg_mode in ["seq-mean-token-sum", "seq-mean-token-sum-norm"]:
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
-        seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
+        # exclude fully masked sequences
+        seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()
         if global_batch_size is None:
             if dp_size > 1:
-                raise ValueError("global_batch_size is required when dp_size > 1")
+                raise ValueError(
+                    "global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
         if torch.is_tensor(global_batch_size):
             if global_batch_size.item() == 0:
                 return zero_loss
         elif global_batch_size == 0:
             return zero_loss
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / \
+            global_batch_size * dp_size  # seq-mean
         if loss_agg_mode == "seq-mean-token-sum-norm":
             if loss_scale_factor is None:
                 horizon = loss_mask.shape[-1]
@@ -1634,18 +2113,21 @@ def agg_loss(
             loss /= loss_scale_factor
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / \
+            (seq_mask + 1e-8)  # token-mean
         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
             if dp_size > 1:
-                raise ValueError("global_batch_size is required when dp_size > 1")
+                raise ValueError(
+                    "global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
         if torch.is_tensor(global_batch_size):
             if global_batch_size.item() == 0:
                 return zero_loss
         elif global_batch_size == 0:
             return zero_loss
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / \
+            global_batch_size * dp_size  # seq-mean
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
@@ -1714,16 +2196,19 @@ def compute_policy_loss(
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
     pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        torch.gt(clip_pg_losses1, pg_losses3) *
+        (advantages < 0).float(), response_mask
     )
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(loss_mat=pg_losses,
+                       loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
@@ -1763,7 +2248,8 @@ def compute_policy_loss_vanilla(
 
     assert config is not None
     assert not isinstance(config, AlgoConfig)
-    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    clip_ratio = config.clip_ratio
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
     clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
@@ -1796,12 +2282,14 @@ def compute_policy_loss_vanilla(
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
     pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        torch.gt(clip_pg_losses1, pg_losses3) *
+        (advantages < 0).float(), response_mask
     )
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
@@ -1820,6 +2308,7 @@ def compute_policy_loss_vanilla(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
     return pg_loss, pg_metrics
+
 
 @register_policy_loss("hear")
 def compute_policy_loss_hear(
@@ -1848,7 +2337,7 @@ def compute_policy_loss_hear(
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
     clip_ratio_c = config.get("clip_ratio_c", 3.0)
-    
+
     assert clip_ratio_c > 1.0, (
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
         + f" but get the value: {clip_ratio_c}."
@@ -1859,49 +2348,101 @@ def compute_policy_loss_hear(
     correction_history_size = 10
     correction_beta = 1.0
     correction_lambda = 1.0
-    pl_config = config.policy_loss if hasattr(config, "policy_loss") and config.policy_loss is not None else None
+    neg_correction_lambda = None
+    neg_correction_lambda_multiplier = 2.0
+    pl_config = config.policy_loss if hasattr(
+        config, "policy_loss") and config.policy_loss is not None else None
     if pl_config is not None:
-        enable_correction = bool(getattr(pl_config, "enable_correction", enable_correction))
+        enable_correction = bool(
+            getattr(pl_config, "enable_correction", enable_correction))
         correction_history_size = int(
-            getattr(pl_config, "correction_history_size", correction_history_size)
+            getattr(pl_config, "correction_history_size",
+                    correction_history_size)
         )
-        correction_beta = float(getattr(pl_config, "correction_beta", correction_beta))
-        correction_lambda = float(getattr(pl_config, "correction_lambda", correction_lambda))
+        correction_beta = float(
+            getattr(pl_config, "correction_beta", correction_beta))
+        correction_lambda = float(
+            getattr(pl_config, "correction_lambda", correction_lambda))
+        neg_correction_lambda = getattr(
+            pl_config, "neg_correction_lambda", neg_correction_lambda)
+        neg_correction_lambda_multiplier = float(
+            getattr(pl_config, "neg_correction_lambda_multiplier",
+                    neg_correction_lambda_multiplier)
+        )
 
     correction_history_size = max(correction_history_size, 1)
     correction_lambda = max(correction_lambda, 0.0)
-    
+    neg_correction_lambda_override = neg_correction_lambda
+    if neg_correction_lambda is None:
+        neg_correction_lambda = correction_lambda * max(
+            float(neg_correction_lambda_multiplier), 0.0)
+    neg_correction_lambda = max(float(neg_correction_lambda), 0.0)
+    effective_correction_lambda = correction_lambda
+    effective_correction_beta = correction_beta
+    effective_neg_correction_lambda = neg_correction_lambda
+    entropy_control_metrics = None
+
     # ============ 熵统计和记录 ============
     entropy_mean_value = None
 
     if entropy is not None:
-        entropy_mean = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode="token-mean")
+        entropy_mean = agg_loss(
+            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode="token-mean")
         entropy_mean_value = entropy_mean.item()
-        
+
         device_id = str(log_prob.device)
-        entropy_history_size = max(int(getattr(pl_config, "entropy_history_size", 50) if pl_config else 50), 1)
+        entropy_history_size = max(
+            int(getattr(pl_config, "entropy_history_size", 50) if pl_config else 50), 1)
         if device_id not in _hear_entropy_history or _hear_entropy_history[device_id].maxlen != entropy_history_size:
             existing_history = list(_hear_entropy_history.get(device_id, []))
-            _hear_entropy_history[device_id] = deque(existing_history, maxlen=entropy_history_size)
+            _hear_entropy_history[device_id] = deque(
+                existing_history, maxlen=entropy_history_size)
         if device_id not in _hear_entropy_ema_state:
-            _hear_entropy_ema_state[device_id] = {"mean": entropy_mean_value, "std": 1.0}
-        
+            _hear_entropy_ema_state[device_id] = {
+                "mean": entropy_mean_value, "std": 1.0}
+
         entropy_history = _hear_entropy_history[device_id]
         ema_state = _hear_entropy_ema_state[device_id]
         entropy_history.append(entropy_mean_value)
-        
+
         if len(entropy_history) == 1:
             ema_state["mean"] = entropy_mean_value
             ema_state["std"] = 1.0
         else:
             entropy_ema_beta = float(
-                np.clip(getattr(pl_config, "entropy_ema_beta", 0.1) if pl_config else 0.1, 0.0, 1.0)
+                np.clip(getattr(pl_config, "entropy_ema_beta", 0.1)
+                        if pl_config else 0.1, 0.0, 1.0)
             )
-            ema_state["mean"] = (1 - entropy_ema_beta) * ema_state["mean"] + entropy_ema_beta * entropy_mean_value
+            ema_state["mean"] = (
+                1 - entropy_ema_beta) * ema_state["mean"] + entropy_ema_beta * entropy_mean_value
             if len(entropy_history) >= 5:
                 hist_list = list(entropy_history)
-                current_std = (sum((x - ema_state["mean"]) ** 2 for x in hist_list) / len(hist_list)) ** 0.5
-                ema_state["std"] = (1 - entropy_ema_beta) * ema_state["std"] + entropy_ema_beta * current_std
+                current_std = (
+                    sum((x - ema_state["mean"]) ** 2 for x in hist_list) / len(hist_list)) ** 0.5
+                ema_state["std"] = (1 - entropy_ema_beta) * \
+                    ema_state["std"] + entropy_ema_beta * current_std
+
+    if pl_config is not None:
+        entropy_control_metrics = _update_entropy_control_state(
+            policy_loss_config=pl_config,
+            entropy_mean_value=entropy_mean_value,
+            default_lambda=correction_lambda,
+            default_beta=correction_beta,
+            global_step=getattr(config, "_temp_global_steps", None),
+        )
+        if entropy_control_metrics is not None and bool(getattr(pl_config, "enable_entropy_adaptive_control", False)):
+            effective_correction_lambda = max(
+                float(entropy_control_metrics.get(
+                    "entropy/control_current_lambda", correction_lambda)), 0.0
+            )
+            effective_correction_beta = float(entropy_control_metrics.get(
+                "entropy/control_current_beta", correction_beta))
+            if neg_correction_lambda_override is None:
+                effective_neg_correction_lambda = effective_correction_lambda * max(
+                    float(neg_correction_lambda_multiplier), 0.0
+                )
+            else:
+                effective_neg_correction_lambda = neg_correction_lambda
 
     # Compute token-level importance ratio.
     negative_approx_kl = log_prob - old_log_prob
@@ -1933,19 +2474,28 @@ def compute_policy_loss_hear(
     reuse_epoch = bool(getattr(config, "_temp_hear_reuse_epoch", False))
     if pl_config is not None:
         # 高熵守卫参数
-        high_entropy_guard_enabled = bool(getattr(pl_config, "enable_high_entropy_guard", False))
+        high_entropy_guard_enabled = bool(
+            getattr(pl_config, "enable_high_entropy_guard", False))
         high_entropy_target_ratio = float(
-            np.clip(getattr(pl_config, "high_entropy_guard_min_ratio", high_entropy_target_ratio), 0.0, 1.0)
+            np.clip(getattr(pl_config, "high_entropy_guard_min_ratio",
+                    high_entropy_target_ratio), 0.0, 1.0)
         )
         high_entropy_quantile = float(
-            np.clip(getattr(pl_config, "high_entropy_guard_quantile", high_entropy_quantile), 0.0, 1.0)
+            np.clip(getattr(pl_config, "high_entropy_guard_quantile",
+                    high_entropy_quantile), 0.0, 1.0)
         )
-        high_entropy_selection_ratio = getattr(pl_config, "high_entropy_guard_select_ratio", high_entropy_selection_ratio)
-        high_entropy_max_iters = int(getattr(pl_config, "high_entropy_guard_max_iters", high_entropy_max_iters))
-        high_entropy_low_step = float(getattr(pl_config, "high_entropy_guard_low_step", high_entropy_low_step))
-        high_entropy_high_step = float(getattr(pl_config, "high_entropy_guard_high_step", high_entropy_high_step))
-        guard_lower_min = getattr(pl_config, "high_entropy_guard_lower_min", None)
-        guard_upper_max = getattr(pl_config, "high_entropy_guard_upper_max", None)
+        high_entropy_selection_ratio = getattr(
+            pl_config, "high_entropy_guard_select_ratio", high_entropy_selection_ratio)
+        high_entropy_max_iters = int(
+            getattr(pl_config, "high_entropy_guard_max_iters", high_entropy_max_iters))
+        high_entropy_low_step = float(
+            getattr(pl_config, "high_entropy_guard_low_step", high_entropy_low_step))
+        high_entropy_high_step = float(
+            getattr(pl_config, "high_entropy_guard_high_step", high_entropy_high_step))
+        guard_lower_min = getattr(
+            pl_config, "high_entropy_guard_lower_min", None)
+        guard_upper_max = getattr(
+            pl_config, "high_entropy_guard_upper_max", None)
 
     if guard_lower_min is not None:
         high_entropy_low_min = float(guard_lower_min)
@@ -1962,8 +2512,10 @@ def compute_policy_loss_hear(
 
     if enable_correction:
         device_id = str(log_prob.device)
-        history_queue = get_ratio_history(device_id, max_size=correction_history_size)
-        history_anchor, _, _, _ = _compute_weighted_log_ratio_anchor(history_queue, beta=correction_beta)
+        history_queue = get_ratio_history(
+            device_id, max_size=correction_history_size)
+        history_anchor, _, _, _ = _compute_weighted_log_ratio_anchor(
+            history_queue, beta=effective_correction_beta)
 
     # Stage 2: select high-entropy tokens and run the guard on the raw ratio.
     ratio_low_cur = default_low
@@ -1976,7 +2528,17 @@ def compute_policy_loss_hear(
         else float(max(1e-6, min(1.0, 1.0 - float(high_entropy_quantile))))
     )
     if reuse_epoch:
-        high_entropy_mask = (response_mask > 0) if torch.any(response_mask > 0) else None
+        reuse_ratio = getattr(config, "_temp_hear_reuse_ratio", None)
+        if reuse_ratio is not None:
+            reuse_ratio = float(np.clip(reuse_ratio, 0.0, 1.0))
+        if reuse_ratio is not None and reuse_ratio > 0.0:
+            reuse_selection_ratio = min(selection_ratio / reuse_ratio, 1.0)
+        else:
+            reuse_selection_ratio = 1.0
+        high_entropy_mask = _subsample_existing_mask(
+            response_mask > 0 if torch.any(response_mask > 0) else None,
+            target_ratio=reuse_selection_ratio,
+        )
     else:
         high_entropy_mask = _select_high_entropy_tokens(
             token_entropy=entropy,
@@ -2009,8 +2571,10 @@ def compute_policy_loss_hear(
             response_mask=response_mask,
             history_queue=history_queue,
             clip_high=default_high,
-            beta=correction_beta,
-            correction_lambda=correction_lambda,
+            beta=effective_correction_beta,
+            correction_lambda=effective_correction_lambda,
+            clip_low=default_low,
+            neg_correction_lambda=effective_neg_correction_lambda,
         )
 
     # Compute the HEAR loss with decoupled clip bounds and dual-clip fallback.
@@ -2024,15 +2588,18 @@ def compute_policy_loss_hear(
         )
 
     pg_losses1 = -advantages * corrected_ratio
-    pg_losses2 = -advantages * torch.clamp(corrected_ratio, final_clip_low, final_clip_high)
+    pg_losses2 = -advantages * \
+        torch.clamp(corrected_ratio, final_clip_low, final_clip_high)
     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
     # Dual clip fallback for negative-advantage tokens.
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
     pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        torch.gt(clip_pg_losses1, pg_losses3) *
+        (advantages < 0).float(), response_mask
     )
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
@@ -2050,25 +2617,78 @@ def compute_policy_loss_hear(
     # ============ 存储指标（包括新增的正负优势ratio统计） ============
     if pl_config is not None:
         config_id = id(pl_config)
-        storage_dict = _get_default_hear_metric_storage(default_low, default_high)
+        storage_dict = _get_default_hear_metric_storage(
+            default_low, default_high)
         storage_dict["clip_low"] = float(final_clip_low)
         storage_dict["clip_high"] = float(final_clip_high)
         if high_entropy_guard_stats is not None:
             for key, value in high_entropy_guard_stats.items():
                 storage_dict[key] = float(value)
+        if entropy_control_metrics is not None:
+            for key, value in entropy_control_metrics.items():
+                storage_dict[key] = value
 
         with torch.no_grad():
             if enable_correction:
                 positive_mask = (advantages > 0) & (response_mask > 0)
-                log_default_clip_high = float(np.log(max(default_high, 1e-8)))
-                trigger_threshold = max(history_anchor, log_default_clip_high) if history_anchor is not None else None
-                if trigger_threshold is not None:
-                    correction_trigger_mask = positive_mask & (negative_approx_kl > trigger_threshold)
-                    correction_delta = (corrected_ratio - token_importance_ratio).abs()
-                    correction_mask = correction_trigger_mask & (correction_delta > 1e-6)
-                    storage_dict["ratio/correction_count"] = float(correction_mask.sum().item())
-                    if torch.any(correction_mask):
-                        storage_dict["ratio/correction_mean_diff"] = float(correction_delta[correction_mask].mean().item())
+                negative_mask = (advantages < 0) & (response_mask > 0)
+
+                abs_beta = abs(float(effective_correction_beta))
+                # Recompute anchors here to ensure both high/low thresholds are available.
+                history_anchor_high, mean_log_ratio, std_log_ratio, total_count = _compute_weighted_log_ratio_anchor(
+                    history_queue, beta=abs_beta
+                )
+                if history_anchor_high is not None and total_count > 0:
+                    history_anchor_low = float(
+                        mean_log_ratio) - abs_beta * float(std_log_ratio)
+                    log_default_clip_high = float(
+                        np.log(max(default_high, 1e-8)))
+                    log_default_clip_low = float(
+                        np.log(max(default_low, 1e-8)))
+                    trigger_threshold_high = max(
+                        float(history_anchor_high), log_default_clip_high)
+                    trigger_threshold_low = min(
+                        float(history_anchor_low), log_default_clip_low)
+
+                    pos_trigger = positive_mask & (
+                        negative_approx_kl > trigger_threshold_high)
+                    neg_trigger = negative_mask & (
+                        negative_approx_kl < trigger_threshold_low)
+
+                    correction_delta = (
+                        corrected_ratio - token_importance_ratio).abs()
+                    pos_correction_mask = pos_trigger & (
+                        correction_delta > 1e-6)
+                    neg_correction_mask = neg_trigger & (
+                        correction_delta > 1e-6)
+
+                    # Backward-compatible keys: keep reporting positive-side correction here.
+                    storage_dict["ratio/correction_count"] = float(
+                        pos_correction_mask.sum().item())
+                    storage_dict["ratio/pos_correction_count"] = float(
+                        pos_correction_mask.sum().item())
+                    storage_dict["ratio/neg_correction_count"] = float(
+                        neg_correction_mask.sum().item())
+
+                    if torch.any(pos_correction_mask):
+                        storage_dict["ratio/correction_mean_diff"] = float(
+                            correction_delta[pos_correction_mask].mean().item())
+                        storage_dict["ratio/pos_correction_mean_diff"] = float(
+                            correction_delta[pos_correction_mask].mean().item()
+                        )
+                        storage_dict["ratio/pos_correction_trigger_log_threshold"] = float(
+                            trigger_threshold_high)
+                        storage_dict["ratio/pos_correction_trigger_ratio_threshold"] = float(
+                            np.exp(trigger_threshold_high))
+
+                    if torch.any(neg_correction_mask):
+                        storage_dict["ratio/neg_correction_mean_diff"] = float(
+                            correction_delta[neg_correction_mask].mean().item()
+                        )
+                        storage_dict["ratio/neg_correction_trigger_log_threshold"] = float(
+                            trigger_threshold_low)
+                        storage_dict["ratio/neg_correction_trigger_ratio_threshold"] = float(
+                            np.exp(trigger_threshold_low))
 
         _hear_metric_storage[config_id] = storage_dict
 
@@ -2083,17 +2703,21 @@ def compute_policy_loss_hear(
                 if torch.any(healthy_mask):
                     healthy_log_ratios = negative_approx_kl[healthy_mask]
                     healthy_log_ratio_mean = healthy_log_ratios.mean().item()
-                    healthy_log_ratio_std = healthy_log_ratios.std(unbiased=False).item()
+                    healthy_log_ratio_std = healthy_log_ratios.std(
+                        unbiased=False).item()
                     healthy_count = int(healthy_mask.sum().item())
                     healthy_log_ratio_max = healthy_log_ratios.max().item()
-                    history_queue.append((healthy_log_ratio_mean, healthy_log_ratio_std, healthy_count, healthy_log_ratio_max))
+                    history_queue.append(
+                        (healthy_log_ratio_mean, healthy_log_ratio_std, healthy_count, healthy_log_ratio_max))
                     history_update_frequency = 1.0
 
-            history_queue_mean_log_ratio, history_queue_max_log_ratio, _ = _summarize_log_ratio_history(history_queue)
+            history_queue_mean_log_ratio, history_queue_max_log_ratio, _ = _summarize_log_ratio_history(
+                history_queue)
 
     if pl_config is not None and enable_correction:
         storage_dict["ratio/history_mean_log_ratio"] = (
-            float(history_queue_mean_log_ratio) if history_queue_mean_log_ratio is not None else 0.0
+            float(
+                history_queue_mean_log_ratio) if history_queue_mean_log_ratio is not None else 0.0
         )
         _hear_metric_storage[config_id] = storage_dict
 
@@ -2165,7 +2789,8 @@ def compute_policy_loss_dppo_tv(
     old_prob = torch.exp(old_log_prob)
     valid_positive_mask = (prob - old_prob) <= clip_divergence_high
     valid_negative_mask = (prob - old_prob) >= -clip_divergence_low
-    valid_mask = torch.where(advantages > 0, valid_positive_mask, valid_negative_mask)
+    valid_mask = torch.where(
+        advantages > 0, valid_positive_mask, valid_negative_mask)
     valid_mask = valid_mask.detach().float()
 
     pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
@@ -2179,7 +2804,8 @@ def compute_policy_loss_dppo_tv(
     )
 
     pg_clipfrac = verl_F.masked_mean((1.0 - valid_mask).float(), response_mask)
-    pg_clipfrac_lower = verl_F.masked_mean((ratio > clip_ratio_c).float() * valid_mask, response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        (ratio > clip_ratio_c).float() * valid_mask, response_mask)
 
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
@@ -2247,9 +2873,12 @@ def compute_policy_loss_dppo_kl(
     binary_kl = old_prob * (old_log_prob - log_prob) + (1 - old_prob) * torch.log(
         (1.0 - old_prob + 1e-8) / (1.0 - prob + 1e-8)
     )
-    valid_positive_mask = (binary_kl <= clip_divergence_high) | (prob <= old_prob)
-    valid_negative_mask = (binary_kl <= clip_divergence_low) | (prob >= old_prob)
-    valid_mask = torch.where(advantages > 0, valid_positive_mask, valid_negative_mask)
+    valid_positive_mask = (
+        binary_kl <= clip_divergence_high) | (prob <= old_prob)
+    valid_negative_mask = (
+        binary_kl <= clip_divergence_low) | (prob >= old_prob)
+    valid_mask = torch.where(
+        advantages > 0, valid_positive_mask, valid_negative_mask)
     valid_mask = valid_mask.detach().float()
 
     pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
@@ -2264,7 +2893,8 @@ def compute_policy_loss_dppo_kl(
 
     # For compatibility, return zero for pg_clipfrac_lower (not used in standard DPPO)
     pg_clipfrac = verl_F.masked_mean((1.0 - valid_mask).float(), response_mask)
-    pg_clipfrac_lower = verl_F.masked_mean((ratio > clip_ratio_c).float() * valid_mask, response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        (ratio > clip_ratio_c).float() * valid_mask, response_mask)
 
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
@@ -2283,6 +2913,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -2307,26 +2938,116 @@ def compute_policy_loss_gspo(
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
 
+    enable_correction = False
+    correction_history_size = 10
+    correction_beta = 1.0
+    correction_lambda = 1.0
+    neg_correction_lambda = None
+    neg_correction_lambda_multiplier = 2.0
+    pl_config = config.policy_loss if hasattr(
+        config, "policy_loss") and config.policy_loss is not None else None
+    if pl_config is not None:
+        enable_correction = bool(
+            getattr(pl_config, "enable_correction", enable_correction))
+        correction_history_size = int(
+            getattr(pl_config, "correction_history_size", correction_history_size))
+        correction_beta = float(
+            getattr(pl_config, "correction_beta", correction_beta))
+        correction_lambda = float(
+            getattr(pl_config, "correction_lambda", correction_lambda))
+        neg_correction_lambda = getattr(
+            pl_config, "neg_correction_lambda", neg_correction_lambda)
+        neg_correction_lambda_multiplier = float(
+            getattr(pl_config, "neg_correction_lambda_multiplier",
+                    neg_correction_lambda_multiplier)
+        )
+
+    correction_history_size = max(correction_history_size, 1)
+    correction_lambda = max(correction_lambda, 0.0)
+    neg_correction_lambda_override = neg_correction_lambda
+    if neg_correction_lambda is None:
+        neg_correction_lambda = correction_lambda * max(
+            float(neg_correction_lambda_multiplier), 0.0)
+    neg_correction_lambda = max(float(neg_correction_lambda), 0.0)
+    effective_correction_lambda = correction_lambda
+    effective_correction_beta = correction_beta
+    effective_neg_correction_lambda = neg_correction_lambda
+    entropy_mean_value = None
+    entropy_control_metrics = None
+
+    if entropy is not None:
+        entropy_mean = agg_loss(
+            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode="token-mean")
+        entropy_mean_value = entropy_mean.item()
+
+    if pl_config is not None:
+        entropy_control_metrics = _update_entropy_control_state(
+            policy_loss_config=pl_config,
+            entropy_mean_value=entropy_mean_value,
+            default_lambda=correction_lambda,
+            default_beta=correction_beta,
+            global_step=getattr(config, "_temp_global_steps", None),
+        )
+        if entropy_control_metrics is not None and bool(getattr(pl_config, "enable_entropy_adaptive_control", False)):
+            effective_correction_lambda = max(
+                float(entropy_control_metrics.get(
+                    "entropy/control_current_lambda", correction_lambda)), 0.0
+            )
+            effective_correction_beta = float(entropy_control_metrics.get(
+                "entropy/control_current_beta", correction_beta))
+            if neg_correction_lambda_override is None:
+                effective_neg_correction_lambda = effective_correction_lambda * max(
+                    float(neg_correction_lambda_multiplier), 0.0
+                )
+            else:
+                effective_neg_correction_lambda = neg_correction_lambda
+
     negative_approx_kl = log_prob - old_log_prob
 
     # compute sequence-level importance ratio:
     # si(θ) = (π_θ(yi|x)/π_θold(yi|x))^(1/|yi|) =
     # exp [(1/|y_i|) * Σ_t log(π_θ(y_i,t|x,y_i,<t)/π_θold(y_i,t|x,y_i,<t))]
     seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
-    negative_approx_kl_seq = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
+    negative_approx_kl_seq = torch.sum(
+        negative_approx_kl * response_mask, dim=-1) / seq_lengths
 
     # Combined ratio at token level:
     # s_i,t(θ) = sg[s_i(θ)] · π_θ(y_i,t|x, y_i,<t) / sg[π_θ(y_i,t|x, y_i,<t)]
     # In log space: log(s_i,t(θ)) = sg[log(s_i(θ))] + log_prob - sg[log_prob]
-    log_seq_importance_ratio = log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
-    log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
+    log_seq_importance_ratio = log_prob - \
+        log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
+    log_seq_importance_ratio = torch.clamp(
+        log_seq_importance_ratio, min=-20.0, max=10.0)
+    raw_seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+    corrected_ratio = raw_seq_importance_ratio
+    history_queue = None
+    default_low = 1.0 - clip_ratio_low
+    default_high = 1.0 + clip_ratio_high
+    history_queue_mean_log_ratio = None
 
-    # finaly exp() to remove log
-    seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+    if enable_correction:
+        device_id = str(log_prob.device)
+        history_queue = get_ratio_history(
+            device_id, max_size=correction_history_size)
+        corrected_ratio = adaptive_ratio_correction_token(
+            token_log_ratio=log_seq_importance_ratio,
+            advantages=advantages,
+            response_mask=response_mask,
+            history_queue=history_queue,
+            clip_high=default_high,
+            beta=effective_correction_beta,
+            correction_lambda=effective_correction_lambda,
+            clip_low=default_low,
+            neg_correction_lambda=effective_neg_correction_lambda,
+        )
 
-    pg_losses1 = -advantages * seq_importance_ratio
-    pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses1 = -advantages * corrected_ratio
+    pg_losses2 = -advantages * \
+        torch.clamp(corrected_ratio, default_low, default_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    raw_pg_losses1 = -advantages * raw_seq_importance_ratio
+    raw_pg_losses2 = -advantages * \
+        torch.clamp(raw_seq_importance_ratio, default_low, default_high)
 
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
@@ -2338,14 +3059,207 @@ def compute_policy_loss_gspo(
     )
 
     # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        torch.gt(raw_pg_losses2, raw_pg_losses1).float(), response_mask)
     pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+
+    if pl_config is not None:
+        config_id = id(pl_config)
+        storage_dict = _get_default_hear_metric_storage(
+            default_low, default_high)
+        if entropy_control_metrics is not None:
+            for key, value in entropy_control_metrics.items():
+                storage_dict[key] = value
+
+        with torch.no_grad():
+            if enable_correction and history_queue is not None:
+                positive_mask = (advantages > 0) & (response_mask > 0)
+                negative_mask = (advantages < 0) & (response_mask > 0)
+                abs_beta = abs(float(effective_correction_beta))
+                history_anchor_high, mean_log_ratio, std_log_ratio, total_count = _compute_weighted_log_ratio_anchor(
+                    history_queue, beta=abs_beta
+                )
+                if history_anchor_high is not None and total_count > 0:
+                    history_anchor_low = float(
+                        mean_log_ratio) - abs_beta * float(std_log_ratio)
+                    log_default_clip_high = float(
+                        np.log(max(default_high, 1e-8)))
+                    log_default_clip_low = float(
+                        np.log(max(default_low, 1e-8)))
+                    trigger_threshold_high = max(
+                        float(history_anchor_high), log_default_clip_high)
+                    trigger_threshold_low = min(
+                        float(history_anchor_low), log_default_clip_low)
+                    pos_trigger = positive_mask & (
+                        log_seq_importance_ratio > trigger_threshold_high)
+                    neg_trigger = negative_mask & (
+                        log_seq_importance_ratio < trigger_threshold_low)
+                    correction_delta = (
+                        corrected_ratio - raw_seq_importance_ratio).abs()
+                    pos_correction_mask = pos_trigger & (
+                        correction_delta > 1e-6)
+                    neg_correction_mask = neg_trigger & (
+                        correction_delta > 1e-6)
+
+                    storage_dict["ratio/correction_count"] = float(
+                        pos_correction_mask.sum().item())
+                    storage_dict["ratio/pos_correction_count"] = float(
+                        pos_correction_mask.sum().item())
+                    storage_dict["ratio/neg_correction_count"] = float(
+                        neg_correction_mask.sum().item())
+
+                    if torch.any(pos_correction_mask):
+                        storage_dict["ratio/correction_mean_diff"] = float(
+                            correction_delta[pos_correction_mask].mean().item())
+                        storage_dict["ratio/pos_correction_mean_diff"] = float(
+                            correction_delta[pos_correction_mask].mean().item()
+                        )
+                        storage_dict["ratio/pos_correction_trigger_log_threshold"] = float(
+                            trigger_threshold_high)
+                        storage_dict["ratio/pos_correction_trigger_ratio_threshold"] = float(
+                            np.exp(trigger_threshold_high))
+
+                    if torch.any(neg_correction_mask):
+                        storage_dict["ratio/neg_correction_mean_diff"] = float(
+                            correction_delta[neg_correction_mask].mean().item()
+                        )
+                        storage_dict["ratio/neg_correction_trigger_log_threshold"] = float(
+                            trigger_threshold_low)
+                        storage_dict["ratio/neg_correction_trigger_ratio_threshold"] = float(
+                            np.exp(trigger_threshold_low))
+
+        _hear_metric_storage[config_id] = storage_dict
+
+    if enable_correction and history_queue is not None:
+        with torch.no_grad():
+            seq_advantages = (
+                advantages * response_mask).sum(dim=-1) / seq_lengths
+            positive_seq_mask = seq_advantages > 0
+            log_default_clip_high = float(np.log(max(default_high, 1e-8)))
+            corrected_log_seq_ratio = torch.sum(torch.log(
+                corrected_ratio.clamp_min(1e-8)) * response_mask, dim=-1) / seq_lengths
+            healthy_seq_mask = positive_seq_mask
+            if torch.any(healthy_seq_mask):
+                healthy_log_ratios = corrected_log_seq_ratio[healthy_seq_mask].clamp(
+                    max=log_default_clip_high)
+                history_queue.append(
+                    (
+                        healthy_log_ratios.mean().item(),
+                        healthy_log_ratios.std(unbiased=False).item(),
+                        int(healthy_seq_mask.sum().item()),
+                        healthy_log_ratios.max().item(),
+                    )
+                )
+            history_queue_mean_log_ratio, _, _ = _summarize_log_ratio_history(
+                history_queue)
+
+    if pl_config is not None and enable_correction:
+        storage_dict["ratio/history_mean_log_ratio"] = (
+            float(
+                history_queue_mean_log_ratio) if history_queue_mean_log_ratio is not None else 0.0
+        )
+        _hear_metric_storage[id(pl_config)] = storage_dict
 
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("gepo")
+def compute_policy_loss_gepo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    uid: Any = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the clipped policy objective for GEPO.
+
+    GEPO replaces the per-sequence denominator with a group-shared statistic:
+
+        denominator_g = sum_i q_i^2 / sum_i q_i
+        ratio_i = p_i / denominator_g
+
+    where ``p_i`` and ``q_i`` are sequence-level geometric mean probabilities for
+    responses from the same prompt group.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    batch_size = log_prob.shape[0]
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+    seq_loss_agg_mode = "seq-mean-token-mean"
+
+    group_ids, num_groups = _build_group_ids(
+        uid=uid, batch_size=batch_size, device=log_prob.device)
+    group_counts = torch.bincount(group_ids, minlength=num_groups)
+    expected_group_size = int(getattr(config, "rollout_n", 0) or 0)
+    if expected_group_size > 0 and torch.any(group_counts != expected_group_size):
+        observed_counts = sorted(
+            {int(v) for v in group_counts.detach().cpu().tolist()})
+        raise ValueError(
+            "GEPO requires完整的 response group 才能计算共享分母。"
+            f"期望每组大小为 rollout_n={expected_group_size}，实际观测到 {observed_counts}。"
+            "请确保 batch balancing 与 mini/micro batching 不会拆散同一个 uid 的样本。"
+        )
+
+    seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+    seq_log_prob = torch.sum(log_prob * response_mask, dim=-1) / seq_lengths
+    seq_old_log_prob = torch.sum(
+        old_log_prob * response_mask, dim=-1) / seq_lengths
+
+    q_seq = torch.exp(torch.clamp(
+        seq_old_log_prob.detach(), min=-20.0, max=20.0))
+    group_q_sum = torch.zeros(
+        num_groups, dtype=q_seq.dtype, device=q_seq.device)
+    group_q_sq_sum = torch.zeros_like(group_q_sum)
+    group_q_sum.index_add_(0, group_ids, q_seq)
+    group_q_sq_sum.index_add_(0, group_ids, q_seq.square())
+
+    group_denom = group_q_sq_sum[group_ids] / \
+        group_q_sum[group_ids].clamp_min(1e-12)
+    log_group_denom = torch.log(group_denom.clamp_min(1e-12))
+
+    log_gepo_ratio = log_prob - log_prob.detach() + (seq_log_prob.detach() -
+                                                     log_group_denom.detach()).unsqueeze(-1)
+    log_gepo_ratio = torch.clamp(log_gepo_ratio, min=-20.0, max=10.0)
+    gepo_ratio = torch.exp(log_gepo_ratio)
+
+    pg_losses1 = -advantages * gepo_ratio
+    pg_losses2 = -advantages * \
+        torch.clamp(gepo_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=seq_loss_agg_mode,
+        **config.global_batch_info,
+    )
+
+    negative_approx_kl = log_prob - old_log_prob
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": 0.0,
+        "actor/gepo/group_count": float(num_groups),
+        "actor/gepo/group_denom_mean": float(group_denom.mean().detach().item()),
+        "actor/gepo/q_seq_mean": float(q_seq.mean().detach().item()),
     }
     return pg_loss, pg_metrics
 
@@ -2382,8 +3296,10 @@ def compute_policy_loss_sapo(
     assert isinstance(config, ActorConfig)
 
     # temperature for positive and negative token updates
-    tau_pos = torch.as_tensor(config.tau_pos, dtype=advantages.dtype, device=advantages.device)
-    tau_neg = torch.as_tensor(config.tau_neg, dtype=advantages.dtype, device=advantages.device)
+    tau_pos = torch.as_tensor(
+        config.tau_pos, dtype=advantages.dtype, device=advantages.device)
+    tau_neg = torch.as_tensor(
+        config.tau_neg, dtype=advantages.dtype, device=advantages.device)
 
     def gate_function(x, tau):
         """The gating function used in SAPO"""
@@ -2513,7 +3429,8 @@ def compute_policy_loss_clip_cov(
             Upper bound for clipping covariance. Defaults to 5.0.
     """
     assert config is not None
-    assert not isinstance(config, AlgoConfig), "passing AlgoConfig not supported yet"
+    assert not isinstance(
+        config, AlgoConfig), "passing AlgoConfig not supported yet"
     assert config.policy_loss is not None
 
     clip_cov_ratio = config.policy_loss.clip_cov_ratio if config.policy_loss.clip_cov_ratio is not None else 0.0002
@@ -2537,7 +3454,8 @@ def compute_policy_loss_clip_cov(
         cliprange_high = cliprange
 
     corr = torch.ones_like(advantages)
-    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    pg_losses2 = -advantages * \
+        torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
     clip_by_origin = (pg_losses2 > pg_losses1) & (response_mask > 0)
 
     cov_all = (advantages - verl_F.masked_mean(advantages, response_mask)) * (
@@ -2547,14 +3465,16 @@ def compute_policy_loss_clip_cov(
     cov_all[clip_by_origin] = -torch.inf
 
     clip_num = max(int(clip_cov_ratio * response_mask.sum().item()), 1)
-    top_k_idx = (cov_all < clip_cov_ub) & (cov_all > clip_cov_lb) & (response_mask > 0)
+    top_k_idx = (cov_all < clip_cov_ub) & (
+        cov_all > clip_cov_lb) & (response_mask > 0)
     top_k_idx = torch.nonzero(top_k_idx)
 
     if len(top_k_idx) > 0:
         perm = torch.randperm(len(top_k_idx))
         top_k_idx = top_k_idx[perm[: min(clip_num, len(top_k_idx))]]
     else:
-        top_k_idx = torch.empty((0, 2), device=cov_all.device, dtype=torch.long)
+        top_k_idx = torch.empty(
+            (0, 2), device=cov_all.device, dtype=torch.long)
 
     corr[top_k_idx[:, 0], top_k_idx[:, 1]] = 0
 
@@ -2609,7 +3529,8 @@ def compute_policy_loss_kl_cov(
             Coefficient for the KL penalty term in the loss. Defaults to 1.
     """
     assert config is not None
-    assert not isinstance(config, AlgoConfig), "passing AlgoConfig not supported yet"
+    assert not isinstance(
+        config, AlgoConfig), "passing AlgoConfig not supported yet"
     assert config.policy_loss is not None
 
     kl_cov_ratio = config.policy_loss.kl_cov_ratio if config.policy_loss.kl_cov_ratio is not None else 0.0002
@@ -2633,9 +3554,11 @@ def compute_policy_loss_kl_cov(
     k = min(kl_cov_ratio, len(all_valid_adv))
 
     if k != 0:
-        cov_lst_all = (all_valid_adv - all_valid_adv.mean()) * (all_valid_logp - all_valid_logp.mean())
+        cov_lst_all = (all_valid_adv - all_valid_adv.mean()) * \
+            (all_valid_logp - all_valid_logp.mean())
         k_percent_nums = max(1, int(len(cov_lst_all) * kl_cov_ratio))
-        large_cov_idxs = torch.topk(cov_lst_all, k_percent_nums, largest=True).indices
+        large_cov_idxs = torch.topk(
+            cov_lst_all, k_percent_nums, largest=True).indices
 
         if len(large_cov_idxs) != 0:
             large_cov_idxs = all_valid_idx[large_cov_idxs]
@@ -2687,7 +3610,8 @@ def compute_policy_loss_geo_mean(
 
     assert config is not None
     assert not isinstance(config, AlgoConfig)
-    clip_ratio = config.clip_ratio  # Clipping parameter. See https://arxiv.org/abs/1707.06347.
+    # Clipping parameter. See https://arxiv.org/abs/1707.06347.
+    clip_ratio = config.clip_ratio
     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
 
@@ -2706,16 +3630,20 @@ def compute_policy_loss_geo_mean(
 
     # Clipping at token-level & Clipping wider
     sgn_advantage = torch.sign(advantages)
-    negative_approx_kl_clamp = torch.clamp(negative_approx_kl, -cliprange_low, cliprange_high)
-    negative_approx_kl_min = torch.min(sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
+    negative_approx_kl_clamp = torch.clamp(
+        negative_approx_kl, -cliprange_low, cliprange_high)
+    negative_approx_kl_min = torch.min(
+        sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
     negative_approx_kl_min = sgn_advantage * negative_approx_kl_min
 
     # Geometric-Mean Policy Optimization
     response_mask_sum = response_mask.sum(dim=-1)
-    ratio = torch.exp((negative_approx_kl_min * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8))
+    ratio = torch.exp((negative_approx_kl_min *
+                      response_mask).sum(dim=-1) / (response_mask_sum + 1e-8))
     # we only support sequence level advantage for now,
     # otherwise, below would be not consistent with the paper
-    advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+    advantage = (advantages * response_mask).sum(dim=-1) / \
+        (response_mask_sum + 1e-8)
     pg_losses = -advantage * ratio
 
     # Apply rollout correction weights if provided
@@ -2724,7 +3652,8 @@ def compute_policy_loss_geo_mean(
         # Aggregate token-level weights to sequence level using geometric mean for consistency
         # Note: rollout_is_weights is always 2D regardless of aggregation mode
         seq_is_weights = torch.exp(
-            (torch.log(rollout_is_weights + 1e-10) * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+            (torch.log(rollout_is_weights + 1e-10) *
+             response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
         )
         pg_losses = pg_losses * seq_is_weights
 
@@ -2732,8 +3661,10 @@ def compute_policy_loss_geo_mean(
 
     # higher: ratio is too large that need clamp to clip_high (when adv > 0)
     clipped = torch.ne(negative_approx_kl, negative_approx_kl_clamp)
-    pg_clipfrac = verl_F.masked_mean((clipped * (advantages > 0)).float(), response_mask)
-    pg_clipfrac_lower = verl_F.masked_mean((clipped * (advantages < 0)).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        (clipped * (advantages > 0)).float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        (clipped * (advantages < 0)).float(), response_mask)
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
@@ -2782,7 +3713,8 @@ def compute_policy_loss_cispo(
     pg_losses = -clipped_ratio_sg * advantages * log_prob
 
     # Track clipping statistics
-    pg_clipfrac = verl_F.masked_mean((ratio != clipped_ratio).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        (ratio != clipped_ratio).float(), response_mask)
 
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
@@ -2816,7 +3748,8 @@ def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean
     """
     # compute entropy
     token_entropy = verl_F.entropy_from_logits(logits)  # (bs, response_len)
-    entropy_loss = agg_loss(loss_mat=token_entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    entropy_loss = agg_loss(
+        loss_mat=token_entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
     return entropy_loss
 
 
@@ -2853,12 +3786,15 @@ def compute_value_loss(
         vf_clipfrac (float):
             Fraction of elements where the clipped loss was used.
     """
-    vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
+    vpredclipped = verl_F.clip_by_value(
+        vpreds, values - cliprange_value, values + cliprange_value)
     vf_losses1 = (vpreds - returns) ** 2
     vf_losses2 = (vpredclipped - returns) ** 2
     clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
-    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
+    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses,
+                             loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    vf_clipfrac = verl_F.masked_mean(
+        torch.gt(vf_losses2, vf_losses1).float(), response_mask)
     return vf_loss, vf_clipfrac
 
 
@@ -2962,7 +3898,8 @@ def compute_pf_ppo_reweight_data(
         elif reweight_method == "max_min":
             max_score = torch.max(scores)
             min_score = torch.min(scores)
-            weights = torch.where((scores == max_score) | (scores == min_score), 1.0, 0.0)
+            weights = torch.where((scores == max_score) |
+                                  (scores == min_score), 1.0, 0.0)
         elif reweight_method == "max_random":
             max_score = torch.max(scores)
             weights = torch.where(scores == max_score, 0.4, 0.1)
@@ -2977,7 +3914,8 @@ def compute_pf_ppo_reweight_data(
     batch_size = scores.shape[0]
     sample_indices = torch.multinomial(weights, batch_size, replacement=True)
 
-    resampled_batch = {key: tensor[sample_indices] for key, tensor in data.batch.items()}
+    resampled_batch = {key: tensor[sample_indices]
+                       for key, tensor in data.batch.items()}
 
     sample_indices_np = sample_indices.numpy()
     resampled_non_tensor_batch = {}
@@ -2985,7 +3923,8 @@ def compute_pf_ppo_reweight_data(
         if isinstance(array, np.ndarray):
             resampled_non_tensor_batch[key] = array[sample_indices_np]
         else:
-            resampled_non_tensor_batch[key] = [array[i] for i in sample_indices_np]
+            resampled_non_tensor_batch[key] = [array[i]
+                                               for i in sample_indices_np]
 
     resampled_meta_info = {}
     for key, value in data.meta_info.items():
@@ -3147,7 +4086,8 @@ def compute_policy_loss_bypass_mode(
     assert config is not None, "config is required for bypass_mode loss"
 
     # Extract rollout_correction config from policy_loss
-    rollout_corr_config = config.policy_loss.get("rollout_correction", None) if hasattr(config, "policy_loss") else None
+    rollout_corr_config = config.policy_loss.get(
+        "rollout_correction", None) if hasattr(config, "policy_loss") else None
 
     if rollout_corr_config is None:
         raise ValueError(
@@ -3159,9 +4099,11 @@ def compute_policy_loss_bypass_mode(
     loss_type = rollout_corr_config.get("loss_type", "ppo_clip")
     rollout_is = rollout_corr_config.get("rollout_is", None)
     rollout_is_threshold = rollout_corr_config.get("rollout_is_threshold", 2.0)
-    rollout_is_batch_normalize = rollout_corr_config.get("rollout_is_batch_normalize", False)
+    rollout_is_batch_normalize = rollout_corr_config.get(
+        "rollout_is_batch_normalize", False)
     rollout_rs = rollout_corr_config.get("rollout_rs", None)
-    rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
+    rollout_rs_threshold = rollout_corr_config.get(
+        "rollout_rs_threshold", None)
 
     # In bypass mode: old_log_prob IS rollout_log_prob
     rollout_log_prob = old_log_prob
@@ -3171,7 +4113,8 @@ def compute_policy_loss_bypass_mode(
     with torch.no_grad():
         rollout_is_weights_proto, modified_response_mask, rollout_metrics = (
             compute_rollout_correction_and_rejection_mask(
-                old_log_prob=log_prob,  # Current policy (for IS ratio: π_current / π_rollout)
+                # Current policy (for IS ratio: π_current / π_rollout)
+                old_log_prob=log_prob,
                 rollout_log_prob=rollout_log_prob,  # Rollout policy
                 response_mask=response_mask,
                 rollout_is=rollout_is,
@@ -3183,7 +4126,8 @@ def compute_policy_loss_bypass_mode(
         )
 
     # Extract IS weights tensor (or None if disabled)
-    computed_is_weights = rollout_is_weights_proto.batch["rollout_is_weights"] if rollout_is_weights_proto else None
+    computed_is_weights = rollout_is_weights_proto.batch[
+        "rollout_is_weights"] if rollout_is_weights_proto else None
 
     # Apply rejection mask (RS + veto)
     effective_mask = modified_response_mask
@@ -3216,7 +4160,8 @@ def compute_policy_loss_bypass_mode(
         )
 
     else:
-        raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'reinforce' or 'ppo_clip'.")
+        raise ValueError(
+            f"Invalid loss_type: {loss_type}. Must be 'reinforce' or 'ppo_clip'.")
 
     # Merge rollout correction metrics
     pg_metrics.update(rollout_metrics)

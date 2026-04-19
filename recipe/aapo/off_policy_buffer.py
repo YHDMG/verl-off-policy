@@ -51,7 +51,8 @@ OFF_POLICY_NON_TENSOR_KEYS = ("uid", "multi_modal_inputs")
 
 
 def compute_off_policy_warmup_size(config: OffPolicyConfig, train_batch_size: int, rollout_n: int) -> int:
-    raw_warmup_size = max(int(config.warmup_steps), 0) * int(train_batch_size) * int(rollout_n)
+    raw_warmup_size = max(int(config.warmup_steps), 0) * \
+        int(train_batch_size) * int(rollout_n)
     return min(raw_warmup_size, int(config.capacity))
 
 
@@ -78,14 +79,16 @@ class OffPolicyReplayBuffer:
         self.config = config
         self.capacity = int(config.capacity)
         if self.capacity <= 0:
-            raise ValueError(f"OffPolicyReplayBuffer capacity must be positive, got {self.capacity}")
+            raise ValueError(
+                f"OffPolicyReplayBuffer capacity must be positive, got {self.capacity}")
         supported_quality_metrics = {"seq_reward", "seq_mean_entropy"}
         if config.quality_metric not in supported_quality_metrics:
             raise ValueError(
                 "OffPolicyReplayBuffer v1 only supports quality_metric in "
                 f"{supported_quality_metrics}. Got {config.quality_metric}."
             )
-        supported_difficulty_metrics = {"group_relative_dispersion", "pass_rate"}
+        supported_difficulty_metrics = {
+            "group_relative_dispersion", "pass_rate"}
         if config.difficulty_metric not in supported_difficulty_metrics:
             raise ValueError(
                 "OffPolicyReplayBuffer difficulty sampling only supports "
@@ -96,7 +99,8 @@ class OffPolicyReplayBuffer:
         self.non_tensor_pool: dict[str, np.ndarray] = {}
         self.size = 0
         self.position = 0
-        self.storage_device = torch.device("cpu") if config.cpu_offload else None
+        self.storage_device = torch.device(
+            "cpu") if config.cpu_offload else None
 
         self.source_steps = np.full(self.capacity, -1, dtype=np.int64)
         self.seq_rewards = np.zeros(self.capacity, dtype=np.float32)
@@ -104,7 +108,8 @@ class OffPolicyReplayBuffer:
         self.quality_z = np.zeros(self.capacity, dtype=np.float32)
         self.seq_lens = np.zeros(self.capacity, dtype=np.int32)
         self.prompt_uids = np.empty(self.capacity, dtype=object)
-        self.prompt_success_rates = np.full(self.capacity, 0.5, dtype=np.float32)
+        self.prompt_success_rates = np.full(
+            self.capacity, 0.5, dtype=np.float32)
         self.prompt_informativeness = np.ones(self.capacity, dtype=np.float32)
         self.prompt_reward_spans = np.zeros(self.capacity, dtype=np.float32)
 
@@ -128,13 +133,17 @@ class OffPolicyReplayBuffer:
         total_selected = len(selected)
         block_size = min(total_selected, self.capacity)
         source_start = total_selected - block_size
-        insert_indices = (self.position + np.arange(block_size)) % self.capacity
-        insert_index_tensor = torch.as_tensor(insert_indices, dtype=torch.long, device=self.pool.device)
+        insert_indices = (
+            self.position + np.arange(block_size)) % self.capacity
+        insert_index_tensor = torch.as_tensor(
+            insert_indices, dtype=torch.long, device=self.pool.device)
 
-        seq_reward = selected.batch["token_level_scores"].sum(dim=-1).detach().to(torch.float32).cpu()
+        seq_reward = selected.batch["token_level_scores"].sum(
+            dim=-1).detach().to(torch.float32).cpu()
         seq_mean_entropy = self._extract_seq_mean_entropy(selected)
         response_mask = selected.batch["response_mask"]
-        seq_len = response_mask.sum(dim=-1).detach().to(torch.int32).cpu().numpy()
+        seq_len = response_mask.sum(
+            dim=-1).detach().to(torch.int32).cpu().numpy()
         uid_array = selected.non_tensor_batch.get("uid")
         prompt_success_rate, prompt_informativeness, prompt_reward_span = self._compute_prompt_difficulty_features(
             seq_reward, uid_array
@@ -142,29 +151,31 @@ class OffPolicyReplayBuffer:
         quality_values, lower_is_better = self._compute_quality_values(
             seq_reward=seq_reward, seq_mean_entropy=seq_mean_entropy
         )
-        quality_z = self._compute_quality_z(quality_values, lower_is_better=lower_is_better)
+        quality_z = self._compute_quality_z(
+            quality_values, lower_is_better=lower_is_better)
 
         for key, value in selected.batch.items():
-            source_value = value[source_start : source_start + block_size].detach()
+            source_value = value[source_start: source_start +
+                                 block_size].detach()
             target_value = source_value.to(self.pool.device)
             self.pool[key].index_copy_(0, insert_index_tensor, target_value)
 
         for key, value in selected.non_tensor_batch.items():
-            self.non_tensor_pool[key][insert_indices] = value[source_start : source_start + block_size]
+            self.non_tensor_pool[key][insert_indices] = value[source_start: source_start + block_size]
 
         if uid_array is not None:
-            self.prompt_uids[insert_indices] = uid_array[source_start : source_start + block_size]
+            self.prompt_uids[insert_indices] = uid_array[source_start: source_start + block_size]
         else:
             self.prompt_uids[insert_indices] = ""
 
         self.source_steps[insert_indices] = int(global_step)
-        self.seq_rewards[insert_indices] = seq_reward[source_start : source_start + block_size].numpy()
-        self.seq_mean_entropy[insert_indices] = seq_mean_entropy[source_start : source_start + block_size].numpy()
-        self.quality_z[insert_indices] = quality_z[source_start : source_start + block_size]
-        self.seq_lens[insert_indices] = seq_len[source_start : source_start + block_size]
-        self.prompt_success_rates[insert_indices] = prompt_success_rate[source_start : source_start + block_size]
-        self.prompt_informativeness[insert_indices] = prompt_informativeness[source_start : source_start + block_size]
-        self.prompt_reward_spans[insert_indices] = prompt_reward_span[source_start : source_start + block_size]
+        self.seq_rewards[insert_indices] = seq_reward[source_start: source_start + block_size].numpy()
+        self.seq_mean_entropy[insert_indices] = seq_mean_entropy[source_start: source_start + block_size].numpy()
+        self.quality_z[insert_indices] = quality_z[source_start: source_start + block_size]
+        self.seq_lens[insert_indices] = seq_len[source_start: source_start + block_size]
+        self.prompt_success_rates[insert_indices] = prompt_success_rate[source_start: source_start + block_size]
+        self.prompt_informativeness[insert_indices] = prompt_informativeness[source_start: source_start + block_size]
+        self.prompt_reward_spans[insert_indices] = prompt_reward_span[source_start: source_start + block_size]
 
         self.position = (self.position + block_size) % self.capacity
         self.size = min(self.size + block_size, self.capacity)
@@ -178,6 +189,8 @@ class OffPolicyReplayBuffer:
         uniform_mix: Optional[float] = None,
         bias_beta: Optional[float] = None,
         bias_weight_clip: Optional[float] = None,
+        group_by_uid: bool = False,
+        group_size: Optional[int] = None,
     ) -> OffPolicySampleMetrics:
         metrics = self._empty_metrics(batch_size)
         if batch_size <= 0 or self.size == 0:
@@ -185,17 +198,33 @@ class OffPolicyReplayBuffer:
 
         valid_indices = self._get_valid_indices(current_step)
         if valid_indices.size == 0 or valid_indices.size < batch_size:
-            metrics["off_policy/replay_hit_rate"] = valid_indices.size / float(max(batch_size, 1))
+            metrics["off_policy/replay_hit_rate"] = valid_indices.size / \
+                float(max(batch_size, 1))
             return OffPolicySampleMetrics(metrics=metrics, batch=None)
 
         ages = current_step - self.source_steps[valid_indices]
-        priorities = self._compute_priorities(valid_indices, ages, quality_alpha=quality_alpha)
+        priorities = self._compute_priorities(
+            valid_indices, ages, quality_alpha=quality_alpha)
         probabilities = self._mix_uniform(priorities, uniform_mix=uniform_mix)
 
-        sampled_indices = np.random.choice(valid_indices, size=batch_size, replace=False, p=probabilities)
-        sample_positions = np.searchsorted(valid_indices, sampled_indices)
-        sampled_ages = ages[sample_positions]
-        sampled_probabilities = probabilities[sample_positions]
+        if group_by_uid:
+            sampled_indices, sampled_ages, sampled_probabilities = self._sample_grouped_indices(
+                valid_indices=valid_indices,
+                ages=ages,
+                probabilities=probabilities,
+                batch_size=batch_size,
+                group_size=group_size,
+            )
+            if sampled_indices is None:
+                metrics["off_policy/replay_hit_rate"] = valid_indices.size / \
+                    float(max(batch_size, 1))
+                return OffPolicySampleMetrics(metrics=metrics, batch=None)
+        else:
+            sampled_indices = np.random.choice(
+                valid_indices, size=batch_size, replace=False, p=probabilities)
+            sample_positions = np.searchsorted(valid_indices, sampled_indices)
+            sampled_ages = ages[sample_positions]
+            sampled_probabilities = probabilities[sample_positions]
 
         batch = self._gather_batch(sampled_indices)
         replay_sampling_weight = self._compute_replay_sampling_weight(
@@ -205,9 +234,11 @@ class OffPolicyReplayBuffer:
             bias_weight_clip=bias_weight_clip,
             device=batch.batch.device,
         )
-        batch = batch.union(DataProto.from_dict(tensors={"replay_sampling_weight": replay_sampling_weight}))
+        batch = batch.union(DataProto.from_dict(
+            tensors={"replay_sampling_weight": replay_sampling_weight}))
         metrics.update(self._compute_sample_health_metrics(batch))
-        metrics.update(self._compute_sample_difficulty_metrics(sampled_indices))
+        metrics.update(
+            self._compute_sample_difficulty_metrics(sampled_indices))
         metrics.update(
             {
                 "off_policy/buffer_size": float(self.size),
@@ -229,10 +260,98 @@ class OffPolicyReplayBuffer:
         )
         return OffPolicySampleMetrics(metrics=metrics, batch=batch)
 
+    def _sample_grouped_indices(
+        self,
+        valid_indices: np.ndarray,
+        ages: np.ndarray,
+        probabilities: np.ndarray,
+        batch_size: int,
+        group_size: Optional[int],
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        group_size = int(group_size or 0)
+        if group_size <= 0:
+            raise ValueError(
+                f"group_size must be positive when group_by_uid=True, got {group_size}")
+        if batch_size % group_size != 0:
+            raise ValueError(
+                f"Grouped replay requires batch_size ({batch_size}) to be divisible by group_size ({group_size})."
+            )
+
+        group_records: list[tuple[np.ndarray, np.ndarray, float]] = []
+        current_uid = None
+        current_indices: list[int] = []
+        current_positions: list[int] = []
+
+        for pos, buffer_idx in enumerate(valid_indices.tolist()):
+            uid = self._normalize_group_key(self.prompt_uids[buffer_idx])
+            if current_uid is None or uid == current_uid:
+                current_uid = uid
+                current_indices.append(buffer_idx)
+                current_positions.append(pos)
+                continue
+
+            if len(current_indices) == group_size:
+                position_array = np.asarray(current_positions, dtype=np.int64)
+                group_records.append(
+                    (
+                        np.asarray(current_indices, dtype=np.int64),
+                        position_array,
+                        float(probabilities[position_array].sum()),
+                    )
+                )
+            current_uid = uid
+            current_indices = [buffer_idx]
+            current_positions = [pos]
+
+        if current_indices and len(current_indices) == group_size:
+            position_array = np.asarray(current_positions, dtype=np.int64)
+            group_records.append(
+                (
+                    np.asarray(current_indices, dtype=np.int64),
+                    position_array,
+                    float(probabilities[position_array].sum()),
+                )
+            )
+
+        required_groups = batch_size // group_size
+        if len(group_records) < required_groups:
+            return None, None, None
+
+        group_probabilities = np.asarray(
+            [record[2] for record in group_records], dtype=np.float64)
+        group_probabilities = np.clip(
+            group_probabilities, a_min=1e-12, a_max=None)
+        group_probabilities = group_probabilities / group_probabilities.sum()
+        selected_group_ids = np.random.choice(
+            len(group_records),
+            size=required_groups,
+            replace=False,
+            p=group_probabilities,
+        )
+
+        sampled_indices = []
+        sampled_ages = []
+        sampled_probabilities = []
+        for group_id in selected_group_ids.tolist():
+            group_indices, position_array, group_probability = group_records[group_id]
+            sampled_indices.append(group_indices)
+            sampled_ages.append(ages[position_array])
+            sampled_probabilities.append(
+                np.full(group_indices.shape[0], group_probability, dtype=np.float64))
+
+        return (
+            np.concatenate(sampled_indices, axis=0),
+            np.concatenate(sampled_ages, axis=0),
+            np.concatenate(sampled_probabilities, axis=0),
+        )
+
     def _select_replay_fields(self, batch: DataProto) -> DataProto:
-        batch_keys = [key for key in OFF_POLICY_BATCH_KEYS if key in batch.batch.keys()]
-        batch_keys.extend(key for key in OFF_POLICY_OPTIONAL_BATCH_KEYS if key in batch.batch.keys())
-        non_tensor_keys = [key for key in OFF_POLICY_NON_TENSOR_KEYS if key in batch.non_tensor_batch]
+        batch_keys = [
+            key for key in OFF_POLICY_BATCH_KEYS if key in batch.batch.keys()]
+        batch_keys.extend(
+            key for key in OFF_POLICY_OPTIONAL_BATCH_KEYS if key in batch.batch.keys())
+        non_tensor_keys = [
+            key for key in OFF_POLICY_NON_TENSOR_KEYS if key in batch.non_tensor_batch]
         return batch.select(batch_keys=batch_keys, non_tensor_batch_keys=non_tensor_keys, deepcopy=True)
 
     def _filter_zero_adv_groups(self, batch: DataProto) -> OffPolicyAddMetrics:
@@ -250,7 +369,8 @@ class OffPolicyReplayBuffer:
 
         advantages = batch.batch["advantages"].detach().to(torch.float32)
         response_mask = batch.batch["response_mask"].detach().to(torch.float32)
-        seq_adv_abs_max = (advantages.abs() * response_mask).amax(dim=-1).cpu().numpy()
+        seq_adv_abs_max = (advantages.abs() *
+                           response_mask).amax(dim=-1).cpu().numpy()
 
         uid_values = batch.non_tensor_batch.get("uid")
         if uid_values is None:
@@ -285,21 +405,25 @@ class OffPolicyReplayBuffer:
         if accepted_indices.size == 0:
             return OffPolicyAddMetrics(metrics=metrics, batch=None)
 
-        filtered_batch = batch.select_idxs(torch.as_tensor(accepted_indices, dtype=torch.long))
+        filtered_batch = batch.select_idxs(
+            torch.as_tensor(accepted_indices, dtype=torch.long))
         return OffPolicyAddMetrics(metrics=metrics, batch=filtered_batch)
 
     def _lazy_init(self, sample: DataProto) -> None:
-        device = self.storage_device if self.storage_device is not None else next(iter(sample.batch.values())).device
+        device = self.storage_device if self.storage_device is not None else next(
+            iter(sample.batch.values())).device
         self.pool = TensorDict(
             {
-                key: torch.zeros((self.capacity, *value.shape[1:]), dtype=value.dtype, device=device)
+                key: torch.zeros(
+                    (self.capacity, *value.shape[1:]), dtype=value.dtype, device=device)
                 for key, value in sample.batch.items()
             },
             batch_size=[self.capacity],
             device=device,
         )
         for key, value in sample.non_tensor_batch.items():
-            self.non_tensor_pool[key] = np.empty((self.capacity, *value.shape[1:]), dtype=object)
+            self.non_tensor_pool[key] = np.empty(
+                (self.capacity, *value.shape[1:]), dtype=object)
 
     def _get_valid_indices(self, current_step: int) -> np.ndarray:
         if self.size == self.capacity:
@@ -323,10 +447,12 @@ class OffPolicyReplayBuffer:
     ) -> np.ndarray:
         if quality_alpha is None:
             quality_alpha = float(self.config.quality_alpha)
-        quality_term = np.exp(float(quality_alpha) * self.quality_z[valid_indices])
+        quality_term = np.exp(float(quality_alpha) *
+                              self.quality_z[valid_indices])
         difficulty_term = self._compute_difficulty_priority_term(valid_indices)
         if int(self.config.staleness_horizon) > 0:
-            staleness_term = np.exp(-ages / float(self.config.staleness_horizon))
+            staleness_term = np.exp(-ages /
+                                    float(self.config.staleness_horizon))
         else:
             staleness_term = np.ones_like(quality_term)
         priorities = quality_term * difficulty_term * staleness_term
@@ -339,12 +465,14 @@ class OffPolicyReplayBuffer:
             uniform_mix = float(self.config.uniform_mix)
         if uniform_mix <= 0:
             return normalized
-        uniform = np.full_like(normalized, 1.0 / normalized.size, dtype=np.float64)
+        uniform = np.full_like(
+            normalized, 1.0 / normalized.size, dtype=np.float64)
         return (1.0 - uniform_mix) * normalized + uniform_mix * uniform
 
     def _gather_batch(self, indices: np.ndarray) -> DataProto:
         assert self.pool is not None
-        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.pool.device)
+        index_tensor = torch.as_tensor(
+            indices, dtype=torch.long, device=self.pool.device)
         tensor_batch = {
             key: value.index_select(0, index_tensor).clone()
             for key, value in self.pool.items()
@@ -368,10 +496,12 @@ class OffPolicyReplayBuffer:
         if bias_weight_clip is None:
             bias_weight_clip = float(self.config.replay_bias_weight_clip)
 
-        sampled_probabilities = np.clip(sampled_probabilities.astype(np.float64, copy=False), a_min=1e-12, a_max=None)
+        sampled_probabilities = np.clip(sampled_probabilities.astype(
+            np.float64, copy=False), a_min=1e-12, a_max=None)
         valid_count = max(int(valid_count), 1)
         uniform_probability = 1.0 / float(valid_count)
-        weights = np.power(uniform_probability / sampled_probabilities, float(bias_beta)).astype(np.float64, copy=False)
+        weights = np.power(uniform_probability / sampled_probabilities,
+                           float(bias_beta)).astype(np.float64, copy=False)
         weights = np.clip(weights, a_min=0.0, a_max=float(bias_weight_clip))
         weights = weights / max(weights.mean(), 1e-12)
         return torch.as_tensor(weights, dtype=torch.float32, device=device)
@@ -390,7 +520,8 @@ class OffPolicyReplayBuffer:
         if not torch.any(seq_mask):
             return metrics
 
-        seq_mean_weight = verl_F.masked_mean(batch.batch["rollout_is_weights"], response_mask, axis=-1)[seq_mask]
+        seq_mean_weight = verl_F.masked_mean(
+            batch.batch["rollout_is_weights"], response_mask, axis=-1)[seq_mask]
         if seq_mean_weight.numel() == 0:
             return metrics
 
@@ -403,8 +534,10 @@ class OffPolicyReplayBuffer:
 
         seq_deviation = (seq_mean_weight - 1.0).abs()
         metrics["off_policy/sample_rollout_is_eff_sample_size"] = ess
-        metrics["off_policy/sample_rollout_is_seq_abs_mean_deviation"] = float(seq_deviation.mean().item())
-        metrics["off_policy/sample_rollout_is_seq_max_deviation"] = float(seq_deviation.max().item())
+        metrics["off_policy/sample_rollout_is_seq_abs_mean_deviation"] = float(
+            seq_deviation.mean().item())
+        metrics["off_policy/sample_rollout_is_seq_max_deviation"] = float(
+            seq_deviation.max().item())
         return metrics
 
     def _compute_quality_values(
@@ -482,10 +615,12 @@ class OffPolicyReplayBuffer:
                 continue
             group_indices = np.asarray(indices, dtype=np.int64)
             group_success_rate = float(success_mask[group_indices].mean())
-            group_informativeness = float(np.clip(4.0 * group_success_rate * (1.0 - group_success_rate), 0.0, 1.0))
+            group_informativeness = float(
+                np.clip(4.0 * group_success_rate * (1.0 - group_success_rate), 0.0, 1.0))
             prompt_success_rate[group_indices] = group_success_rate
             prompt_informativeness[group_indices] = group_informativeness
-            prompt_reward_span[group_indices] = float(reward_np[group_indices].max() - reward_np[group_indices].min())
+            prompt_reward_span[group_indices] = float(
+                reward_np[group_indices].max() - reward_np[group_indices].min())
 
         return prompt_success_rate, prompt_informativeness, prompt_reward_span
 
@@ -529,8 +664,10 @@ class OffPolicyReplayBuffer:
                 continue
 
             normalized_rewards = (group_rewards - reward_min) / reward_span
-            pairwise_distance = np.abs(normalized_rewards[:, None] - normalized_rewards[None, :]).mean()
-            group_informativeness = float(np.clip(2.0 * pairwise_distance, 0.0, 1.0))
+            pairwise_distance = np.abs(
+                normalized_rewards[:, None] - normalized_rewards[None, :]).mean()
+            group_informativeness = float(
+                np.clip(2.0 * pairwise_distance, 0.0, 1.0))
             prompt_informativeness[group_indices] = group_informativeness
 
         return prompt_success_rate, prompt_informativeness, prompt_reward_span
@@ -540,16 +677,19 @@ class OffPolicyReplayBuffer:
             return np.ones(valid_indices.shape[0], dtype=np.float64)
 
         difficulty_alpha = max(float(self.config.difficulty_alpha), 0.0)
-        min_priority_scale = float(np.clip(self.config.difficulty_min_priority_scale, 0.0, 1.0))
+        min_priority_scale = float(
+            np.clip(self.config.difficulty_min_priority_scale, 0.0, 1.0))
         informativeness = np.nan_to_num(
-            self.prompt_informativeness[valid_indices].astype(np.float64, copy=False),
+            self.prompt_informativeness[valid_indices].astype(
+                np.float64, copy=False),
             nan=1.0,
             posinf=1.0,
             neginf=0.0,
         )
         informativeness = np.clip(informativeness, 0.0, 1.0)
         if difficulty_alpha != 1.0:
-            informativeness = np.power(informativeness, difficulty_alpha).astype(np.float64, copy=False)
+            informativeness = np.power(
+                informativeness, difficulty_alpha).astype(np.float64, copy=False)
         return min_priority_scale + (1.0 - min_priority_scale) * informativeness
 
     def _compute_sample_difficulty_metrics(self, sampled_indices: np.ndarray) -> dict[str, float]:
@@ -565,9 +705,12 @@ class OffPolicyReplayBuffer:
             return metrics
 
         lower_bound, upper_bound = self._get_prompt_difficulty_bucket_bounds()
-        sampled_success_rates = self.prompt_success_rates[sampled_indices].astype(np.float64, copy=False)
-        sampled_informativeness = self.prompt_informativeness[sampled_indices].astype(np.float64, copy=False)
-        sampled_reward_spans = self.prompt_reward_spans[sampled_indices].astype(np.float64, copy=False)
+        sampled_success_rates = self.prompt_success_rates[sampled_indices].astype(
+            np.float64, copy=False)
+        sampled_informativeness = self.prompt_informativeness[sampled_indices].astype(
+            np.float64, copy=False)
+        sampled_reward_spans = self.prompt_reward_spans[sampled_indices].astype(
+            np.float64, copy=False)
         if self.config.difficulty_metric == "pass_rate":
             hard_mask = sampled_success_rates <= lower_bound
             easy_mask = sampled_success_rates >= upper_bound
@@ -577,17 +720,25 @@ class OffPolicyReplayBuffer:
             easy_mask = sampled_informativeness >= upper_bound
             medium_mask = ~(hard_mask | easy_mask)
 
-        metrics["off_policy/sample_prompt_success_rate_mean"] = float(sampled_success_rates.mean())
-        metrics["off_policy/sample_prompt_informativeness_mean"] = float(sampled_informativeness.mean())
-        metrics["off_policy/sample_prompt_reward_span_mean"] = float(sampled_reward_spans.mean())
-        metrics["off_policy/sample_prompt_easy_fraction"] = float(easy_mask.mean())
-        metrics["off_policy/sample_prompt_medium_fraction"] = float(medium_mask.mean())
-        metrics["off_policy/sample_prompt_hard_fraction"] = float(hard_mask.mean())
+        metrics["off_policy/sample_prompt_success_rate_mean"] = float(
+            sampled_success_rates.mean())
+        metrics["off_policy/sample_prompt_informativeness_mean"] = float(
+            sampled_informativeness.mean())
+        metrics["off_policy/sample_prompt_reward_span_mean"] = float(
+            sampled_reward_spans.mean())
+        metrics["off_policy/sample_prompt_easy_fraction"] = float(
+            easy_mask.mean())
+        metrics["off_policy/sample_prompt_medium_fraction"] = float(
+            medium_mask.mean())
+        metrics["off_policy/sample_prompt_hard_fraction"] = float(
+            hard_mask.mean())
         return metrics
 
     def _get_prompt_difficulty_bucket_bounds(self) -> tuple[float, float]:
-        lower_bound = float(np.clip(self.config.difficulty_medium_lower, 0.0, 1.0))
-        upper_bound = float(np.clip(self.config.difficulty_medium_upper, 0.0, 1.0))
+        lower_bound = float(
+            np.clip(self.config.difficulty_medium_lower, 0.0, 1.0))
+        upper_bound = float(
+            np.clip(self.config.difficulty_medium_upper, 0.0, 1.0))
         if lower_bound > upper_bound:
             lower_bound, upper_bound = upper_bound, lower_bound
         return lower_bound, upper_bound
